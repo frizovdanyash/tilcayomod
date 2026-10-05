@@ -31,6 +31,16 @@ class MainActivity : Activity() {
         game.onHostPause()
     }
 
+    override fun onResume() {
+        super.onResume()
+        game.onHostResume()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        game.release()
+    }
+
     @Suppress("DEPRECATION")
     private fun hideSystemBars() {
         window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
