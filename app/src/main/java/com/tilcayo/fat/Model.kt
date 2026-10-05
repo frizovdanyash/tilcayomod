@@ -1,6 +1,7 @@
 package com.tilcayo.fat
 
 import android.content.Context
+import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.math.max
@@ -205,9 +206,10 @@ class SaveData(context: Context) {
         return any
     }
 
-    /** Полный снимок прогресса до первого бонуса. Копии прошлых версий мода тоже читаются. */
-    fun backupForMod() {
-        if (sp.contains("mod_backup_v3") || sp.contains("mod_backup_v2") || sp.contains("mod_backup_herd")) return
+    // ---------- MOD: снимки, экспорт и импорт прогресса ----------
+
+    /** Полный снимок прогресса одним JSON. */
+    private fun progressJson(): JSONObject {
         val data = JSONObject().put("coins", coins).put("best", best).put("lastCollect", lastCollect)
             .put("unlocked", unlocked).put("activeFarm", activeFarm)
             .put("ownedSkins", ownedSkins).put("freeBoxes", freeBoxes)
@@ -217,46 +219,58 @@ class SaveData(context: Context) {
         for (f in farms) all.put(JSONObject().put("herd", JSONArray(f.herd)).put("skin", JSONArray(f.skin))
             .put("selected", f.selected).put("breedEnd", f.breedEnd))
         data.put("farms", all)
-        sp.edit().putString("mod_backup_v3", data.toString()).commit()
+        return data
+    }
+
+    /** Применяет снимок. Сначала разбирает его целиком, только потом трогает текущий прогресс. */
+    private fun applySnapshot(raw: String): Boolean {
+        val data = try { JSONObject(raw) } catch (_: Exception) { return false }
+        val restored = try {
+            val all = data.getJSONArray("farms")
+            require(all.length() == Farms.COUNT)
+            List(Farms.COUNT) { i ->
+                val o = all.getJSONObject(i)
+                Farm().apply {
+                    herd.clear(); skin.clear()
+                    val h = o.getJSONArray("herd"); val sk = o.getJSONArray("skin")
+                    require(h.length() in 1..Balance.MAX_HERD)
+                    for (j in 0 until h.length()) herd.add(h.getInt(j).coerceIn(0, Balance.MAX_FAT))
+                    for (j in 0 until sk.length()) skin.add(sk.getInt(j))
+                    selected = o.getInt("selected"); breedEnd = o.getLong("breedEnd")
+                    normalize()
+                }
+            }
+        } catch (_: Exception) { return false }
+        for (i in farms.indices) {
+            val f = farms[i]; val r = restored[i]
+            f.herd.clear(); f.herd.addAll(r.herd)
+            f.skin.clear(); f.skin.addAll(r.skin)
+            f.selected = r.selected; f.breedEnd = r.breedEnd
+        }
+        coins = data.optLong("coins", 50L); best = data.optInt("best", 0)
+        lastCollect = data.optLong("lastCollect", System.currentTimeMillis())
+        unlocked = data.optInt("unlocked", 1).coerceIn(1, Farms.COUNT)
+        activeFarm = data.optInt("activeFarm", 0).coerceIn(0, unlocked - 1)
+        ownedSkins = data.optLong("ownedSkins", 1L) or 1L
+        freeBoxes = data.optInt("freeBoxes", 0).coerceAtLeast(0)
+        mods = data.optInt("mods", 0)
+        val rb = data.optJSONArray("rushBest")
+        if (rb != null) for (i in rushBest.indices) rushBest[i] = if (i < rb.length()) rb.optLong(i, 0L) else 0L
+        save()
+        return true
+    }
+
+    /** Снимок до первого бонуса. Копии прошлых версий мода тоже читаются. */
+    fun backupForMod() {
+        if (sp.contains("mod_backup_v3") || sp.contains("mod_backup_v2") || sp.contains("mod_backup_herd")) return
+        sp.edit().putString("mod_backup_v3", progressJson().toString()).commit()
     }
 
     /** Откат к снимку. Умеет читать копии формата 1.1 и 1.4. */
     fun restoreModBackup(): Boolean {
         val raw = sp.getString("mod_backup_v3", null) ?: sp.getString("mod_backup_v2", null)
         if (raw != null) {
-            // Сначала разбираем снимок целиком, только потом трогаем текущий прогресс.
-            val data = try { JSONObject(raw) } catch (_: Exception) { return false }
-            val restored = try {
-                val all = data.getJSONArray("farms")
-                require(all.length() == Farms.COUNT)
-                List(Farms.COUNT) { i ->
-                    val o = all.getJSONObject(i)
-                    Farm().apply {
-                        herd.clear(); skin.clear()
-                        val h = o.getJSONArray("herd"); val sk = o.getJSONArray("skin")
-                        require(h.length() in 1..Balance.MAX_HERD)
-                        for (j in 0 until h.length()) herd.add(h.getInt(j).coerceIn(0, Balance.MAX_FAT))
-                        for (j in 0 until sk.length()) skin.add(sk.getInt(j))
-                        selected = o.getInt("selected"); breedEnd = o.getLong("breedEnd")
-                        normalize()
-                    }
-                }
-            } catch (_: Exception) { return false }
-            for (i in farms.indices) {
-                val f = farms[i]; val r = restored[i]
-                f.herd.clear(); f.herd.addAll(r.herd)
-                f.skin.clear(); f.skin.addAll(r.skin)
-                f.selected = r.selected; f.breedEnd = r.breedEnd
-            }
-            coins = data.optLong("coins", 50L); best = data.optInt("best", 0)
-            lastCollect = data.optLong("lastCollect", System.currentTimeMillis())
-            unlocked = data.optInt("unlocked", 1).coerceIn(1, Farms.COUNT)
-            activeFarm = data.optInt("activeFarm", 0).coerceIn(0, unlocked - 1)
-            ownedSkins = data.optLong("ownedSkins", 1L) or 1L
-            freeBoxes = data.optInt("freeBoxes", 0).coerceAtLeast(0)
-            mods = data.optInt("mods", 0)
-            val rb = data.optJSONArray("rushBest")
-            if (rb != null) for (i in rushBest.indices) rushBest[i] = if (i < rb.length()) rb.optLong(i, 0L) else 0L
+            if (!applySnapshot(raw)) return false
         } else {
             val legacy = sp.getString("mod_backup_herd", null) ?: return false
             val restored = legacy.split(",").mapNotNull { it.toIntOrNull() }
@@ -268,12 +282,26 @@ class SaveData(context: Context) {
             selected = sp.getInt("mod_backup_selected", 0).coerceIn(0, herd.lastIndex)
             coins = sp.getLong("mod_backup_coins", 50L); best = sp.getInt("mod_backup_best", 0)
             lastCollect = sp.getLong("mod_backup_collect", System.currentTimeMillis())
+            save()
         }
-        save()
         sp.edit().remove("mod_backup_v3").remove("mod_backup_v2").remove("mod_backup_herd")
             .remove("mod_backup_coins").remove("mod_backup_selected").remove("mod_backup_best")
             .remove("mod_backup_collect").apply()
         return true
+    }
+
+    /** Код прогресса для переноса на другое устройство или после переустановки. */
+    fun exportCode(): String =
+        Base64.encodeToString(progressJson().toString().toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+
+    /** Принимает код прогресса (Base64) или сам JSON снимка. */
+    fun importCode(code: String): Boolean {
+        val text = code.trim()
+        if (text.isEmpty()) return false
+        val raw = if (text.startsWith("{")) text else try {
+            String(Base64.decode(text, Base64.DEFAULT), Charsets.UTF_8)
+        } catch (_: Exception) { return false }
+        return applySnapshot(raw)
     }
 
     fun save() { 

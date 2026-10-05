@@ -149,4 +149,65 @@ class ModSimTest {
         assertEquals(1, s.bossesBeaten)
         assertTrue(s.onWall)
     }
+    @Test fun noSlipHoldsWall() {
+        val s = sim(); s.noSlip = true
+        assertTrue(s.onWall)
+        repeat(180) { s.step(1f / 60f) }
+        assertTrue("держится на стене", s.onWall)
+        assertEquals(0f, s.py, 0f)
+        val normal = sim()
+        repeat(180) { normal.step(1f / 60f) }
+        assertTrue("без мода срывается вниз", normal.py > 50f)
+    }
+    @Test fun lavaPausedStopsRise() {
+        val s = sim(); s.lavaOn = true; s.lavaPaused = true; s.noSlip = true
+        val start = s.lavaY
+        repeat(240) { s.step(1f / 60f) }
+        assertEquals(start, s.lavaY, 0f)
+        assertFalse(s.dead)
+    }
+    @Test fun moonGravityJumpsHigher() {
+        fun apex(mul: Float): Float {
+            val s = sim(); s.gravityMul = mul; s.jump(); s.holdUp = false
+            var top = s.py
+            repeat(120) { s.step(1f / 60f); top = minOf(top, s.py) }
+            return top
+        }
+        val normal = apex(1f)
+        val moon = apex(0.35f)
+        assertTrue("на Луне прыжок выше: $moon против $normal", moon < normal - 40f)
+        val heavy = apex(3f)
+        assertTrue("с тяжёлой гравитацией ниже: $heavy", heavy > normal)
+    }
+    @Test fun autopilotClimbsWithoutInput() {
+        val s = sim(); s.autoPlay = true; s.godMode = true
+        repeat(600) { s.step(1f / 60f) }
+        assertFalse(s.dead)
+        assertTrue("автопилот поднялся: py=${s.py}", s.py < -200f)
+    }
+    @Test fun bossFightGivesInfiniteAmmo() {
+        val s = sim(); s.ammoInfinite = true
+        s.arena = Arena(-600f, 0f, 5).apply { active = true }
+        s.boss = Boss(5).apply { state = Boss.HOVER; x = 300f; y = -300f }
+        s.step(1f / 60f)
+        assertEquals(3, s.ammo)
+        s.ammo = 0
+        s.step(1f / 60f)
+        assertEquals(3, s.ammo)
+    }
+    @Test fun teleportDownMovesDownAndResets() {
+        val s = sim(); s.runCoins = 42f; s.bossesBeaten = 2
+        s.teleportDown(50f)
+        assertEquals(500f, s.py, 0f)
+        assertTrue(s.onWall); assertTrue(s.coins.isEmpty())
+        assertEquals(42f, s.runCoins, 0f); assertEquals(2, s.bossesBeaten)
+        assertTrue(s.shield >= 2f)
+    }
+    @Test fun runCoinsGrantIsBounded() {
+        val s = sim()
+        s.addRunCoins(250f)
+        assertEquals(250f, s.runCoins, 0f)
+        s.addRunCoins(-100f)
+        assertEquals(250f, s.runCoins, 0f)
+    }
 }

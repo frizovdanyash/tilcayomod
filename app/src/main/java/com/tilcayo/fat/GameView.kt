@@ -2,6 +2,8 @@ package com.tilcayo.fat
 
 import android.animation.ArgbEvaluator
 import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.text.InputType
 import android.widget.Button
@@ -476,6 +478,11 @@ class GameView(context: Context) : View(context) {
         sim.magnet = mod.magnet
         sim.instaBoss = mod.instaBoss
         sim.rewardMul = if (mod.coinMul > 1f) mod.coinMul else 1f
+        sim.autoPlay = mod.autoPlay
+        sim.noSlip = mod.noSlip
+        sim.lavaPaused = mod.lavaPaused
+        sim.ammoInfinite = mod.ammoInfinite
+        sim.gravityMul = ModRules.gravityFor(mod.moonJump)
     }
 
     /** Телепорт вверх на N метров с перестройкой мира вокруг новой точки. */
@@ -506,6 +513,23 @@ class GameView(context: Context) : View(context) {
         sfx.play(Sfx.S.SHIELD)
     }
 
+    /** Телепорт вниз: спускаемся к лаве и монетам пониже. */
+    private fun teleportDown(meters: Float) {
+        if (scene != Scene.PLAY || !ModRules.validMeters(meters)) return
+        sim.holdUp = false
+        sim.teleportDown(meters)
+        afterTeleport()
+    }
+
+    private fun clipboard() = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+
+    private fun copyText(text: String) {
+        clipboard().setPrimaryClip(ClipData.newPlainText("Тилкайо MOD", text))
+    }
+
+    private fun pasteText(): String =
+        clipboard().primaryClip?.getItemAt(0)?.coerceToText(context)?.toString().orEmpty()
+
     /** Счётчики мода: высота, монеты, время, боссы и активные усиления. */
     private fun drawModStats(c: Canvas) {
         c.save()
@@ -523,6 +547,12 @@ class GameView(context: Context) : View(context) {
         if (mod.freezeHazards) extras.add("заморозка")
         if (mod.magnet) extras.add("магнит")
         if (mod.instaBoss) extras.add("босс x1")
+        if (mod.autoPlay) extras.add("автопилот")
+        if (mod.noSlip) extras.add("хватка")
+        if (mod.lavaPaused) extras.add("лава стоит")
+        if (mod.ammoInfinite) extras.add("патроны ∞")
+        if (mod.moonJump) extras.add("луна")
+        if (mod.flyMode) extras.add("полёт")
         if (extras.isNotEmpty()) lines.add("MOD: " + extras.joinToString(", "))
         val w = 186f
         val h = 18f * lines.size + 16f
@@ -587,6 +617,11 @@ class GameView(context: Context) : View(context) {
         toggle("Магнит для монет", mod.magnet) { mod.magnet = it }
         toggle("Босс с одного удара", mod.instaBoss) { mod.instaBoss = it }
         toggle("Показывать счётчики в углу", mod.showStats) { mod.showStats = it }
+        toggle("Автопилот: тилкайо играет сам (AFK-фарм)", mod.autoPlay) { mod.autoPlay = it }
+        toggle("Хватка без срыва (не падает со стены)", mod.noSlip) { mod.noSlip = it }
+        toggle("Лава стоит на месте", mod.lavaPaused) { mod.lavaPaused = it }
+        toggle("Лунная гравитация (прыжки выше)", mod.moonJump) { mod.moonJump = it }
+        toggle("В бою с боссом патроны не кончаются", mod.ammoInfinite) { mod.ammoInfinite = it }
         action("СКОРОСТЬ ЗАБЕГА: x${mod.speed}") {
             mod.speed = if (mod.speed >= 3) 1 else mod.speed + 1
             mod.save()
@@ -656,6 +691,54 @@ class GameView(context: Context) : View(context) {
                 }
             }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         })
+        action("ТЕЛЕПОРТ ВНИЗ НА N МЕТРОВ") {
+            val meters = ModRules.parseMeters(distance.text.toString())
+            when {
+                meters == null -> distance.error = "Число от 0,1 до 100 000"
+                !gameOnly(distance) -> Unit
+                else -> {
+                    mod.teleportMeters = meters
+                    mod.save()
+                    teleportDown(meters)
+                    modMsg("Спуск на $meters м")
+                }
+            }
+        }
+
+        section("ЗАБЕГ ПО-БЫСТРОМУ")
+        label("Монеты сразу в текущий забег — без множителей, идут в награду.")
+        val runCoinsField = numberRow("1000")
+        action("+ МОНЕТЫ В ТЕКУЩИЙ ЗАБЕГ") {
+            val value = ModRules.parseCoins(runCoinsField.text.toString())
+            when {
+                value == null -> runCoinsField.error = "Число от 1 до 1 000 000 000"
+                !gameOnly(runCoinsField) -> Unit
+                else -> {
+                    sim.addRunCoins(value.toFloat())
+                    modMsg("В забеге монет: ${runCoins.toInt()}")
+                }
+            }
+        }
+        action("СНЯТЬ ВСЕ МОДИФИКАТОРЫ ЗАБЕГА") {
+            save.backupForMod()
+            save.mods = 0
+            save.save()
+            modMsg("Модификаторы выключены")
+        }
+        action("ВКЛЮЧИТЬ ВСЕ МОДИФИКАТОРЫ (БОЛЬШЕ МОНЕТ)") {
+            save.backupForMod()
+            var mask = 0
+            for (md in Mods.all) mask = Mods.toggle(mask, md.id)
+            save.mods = mask
+            save.save()
+            modMsg("Модификаторов: ${Mods.count(mask)}, монеты x${"%.2f".format(Mods.multiplier(mask))}")
+        }
+        action("СБРОСИТЬ РЕКОРДЫ БОСС-РАША") {
+            save.backupForMod()
+            for (i in save.rushBest.indices) save.rushBest[i] = 0L
+            save.save()
+            modMsg("Рекорды босс-раша сброшены")
+        }
 
         section("ФЕРМА И ПРОГРЕСС")
         label("Перед первым бонусом сохраняется полный снимок прогресса: монеты, рекорд, четыре фермы, наряды, скины, боксы и модификаторы.")
@@ -743,6 +826,51 @@ class GameView(context: Context) : View(context) {
                 syncPets()
                 sim.coinMul = save.coinMultiplier() * Mods.multiplier(save.mods)
                 modMsg(if (ok) "Прогресс восстановлен" else "Резервной копии ещё нет")
+            }
+        }
+        section("НАРЯДЫ И БОКСЫ")
+        val skinField = numberRow(save.skinOf(save.selected).toString())
+        action("НАДЕТЬ СКИН ПО НОМЕРУ НА ВЫБРАННОГО") {
+            val idx = skinField.text.toString().trim().toIntOrNull()
+            val list = Skins.all.mapIndexed { i, sk -> "$i — ${sk.name}" }.joinToString("\n")
+            when {
+                idx == null || idx !in Skins.all.indices -> skinField.error = "Номер от 0 до ${Skins.all.size - 1}\n$list"
+                else -> farmChange("Скин: ${Skins.all[idx].name}") { save.setSkin(save.selected, idx) }
+            }
+        }
+        action("СЛЕДУЮЩИЙ СКИН") {
+            farmChange("Скин переключён") { save.setSkin(save.selected, (save.skinOf(save.selected) + 1) % Skins.all.size) }
+        }
+
+        section("ПЕРЕНОС ПРОГРЕССА")
+        label("Пригодится при переустановке: скопируйте код прогресса и вставьте его в новую установку через буфер обмена.")
+        action("СКОПИРОВАТЬ КОД ПРОГРЕССА") {
+            copyText(save.exportCode())
+            modMsg("Код скопирован в буфер обмена")
+        }
+        val codeField = EditText(context).apply {
+            hint = "Вставьте код прогресса"
+            setSingleLine(true)
+        }
+        content.addView(codeField)
+        action("ВСТАВИТЬ КОД ИЗ БУФЕРА") {
+            codeField.setText(pasteText())
+            modMsg("Код вставлен, нажмите «применить»")
+        }
+        action("ПРИМЕНИТЬ КОД ПРОГРЕССА") {
+            when {
+                scene == Scene.PLAY -> modMsg("Сначала выйдите из забега")
+                save.importCode(codeField.text.toString()) -> {
+                    save.save()
+                    sim.coinMul = save.coinMultiplier() * Mods.multiplier(save.mods)
+                    farmFoods.clear()
+                    petLists.forEach { it.clear() }
+                    viewFarm = save.activeFarm
+                    dragPtr = -1; dragIdx = -1; boxStage = 0
+                    syncPets()
+                    modMsg("Прогресс загружен")
+                }
+                else -> modMsg("Код не подошёл: скопируйте его целиком")
             }
         }
         label("Размер бегуна после прокачки меняется со следующего забега. Телепорт пропускает текущего босса без награды, не собирает пропущенные монеты и даёт щит на 2 секунды.")

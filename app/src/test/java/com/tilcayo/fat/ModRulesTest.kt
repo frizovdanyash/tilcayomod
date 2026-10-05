@@ -45,4 +45,36 @@ class ModRulesTest {
         assertEquals(10f, ModRules.runReward(10f, Float.NaN), 0f)
         assertEquals(10f, ModRules.runReward(10f, -2f), 0f)
     }
+    @Test fun gravityRules() {
+        assertEquals(0.35f, ModRules.gravityFor(true), 0f)
+        assertEquals(1f, ModRules.gravityFor(false), 0f)
+        assertTrue(ModRules.validGravity(0.05f))
+        assertTrue(ModRules.validGravity(3f))
+        assertFalse(ModRules.validGravity(0f))
+        assertFalse(ModRules.validGravity(3.5f))
+        assertFalse(ModRules.validGravity(Float.NaN))
+    }
+    @Test fun downwardTeleportAddsDistance() {
+        assertEquals(500f, ModRules.teleportedDownY(0f, 50f), 0f)
+        assertEquals(-450f, ModRules.teleportedDownY(-1000f, 55f), 0f)
+    }
+    @Test fun runCoinsAreClamped() {
+        assertEquals(255f, ModRules.runCoins(5f, 250f), 0f)
+        assertEquals(5f, ModRules.runCoins(5f, -50f), 0f)
+        assertEquals(1_000_005f, ModRules.runCoins(5f, 9_000_000f), 0f)
+    }
+    @Test fun modifierMaskTogglesWithExclusions() {
+        var mask = 0
+        for (md in Mods.all) mask = Mods.toggle(mask, md.id)
+        assertEquals("несовместимая пара выключается", Mods.all.size - 1, Mods.count(mask))
+        assertFalse(Mods.has(mask, Mods.SPARSE) && Mods.has(mask, Mods.DENSE))
+        assertTrue(Mods.multiplier(mask) > 1f)
+        val before = Mods.count(mask)
+        val enabled = Mods.all.first { Mods.has(mask, it.id) }
+        mask = Mods.toggle(mask, enabled.id)
+        assertEquals(before - 1, Mods.count(mask))
+        mask = Mods.toggle(mask, Mods.SPARSE)
+        assertTrue(Mods.has(mask, Mods.SPARSE))
+        assertFalse(Mods.has(mask, Mods.DENSE))
+    }
 }

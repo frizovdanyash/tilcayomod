@@ -228,6 +228,16 @@ class Sim {
     var instaBoss = false
     /** Множитель награды за забег. */
     var rewardMul = 1f
+    /** Автопилот: тилкайо сам прыгает и отталкивается от стен. */
+    var autoPlay = false
+    /** Не срываться со стены: держится сколько угодно. */
+    var noSlip = false
+    /** Лава стоит на месте и не поднимается. */
+    var lavaPaused = false
+    /** Патроны в бою с боссом не кончаются. */
+    var ammoInfinite = false
+    /** Множитель гравитации: меньше единицы — прыжки выше. */
+    var gravityMul = 1f
     /** Запас на размер хитбокса — решатель перестраховывается. */
     var hrExtra = 0f
 
@@ -352,6 +362,17 @@ class Sim {
         teleportTo(-meters * 10f)
     }
 
+    /** MOD: перенос вниз на N метров (к лаве и монетам пониже). */
+    fun teleportDown(meters: Float) {
+        require(ModRules.validMeters(meters))
+        teleportTo(py + meters * 10f)
+    }
+
+    /** MOD: монеты прямо в забег, без множителя фермы. */
+    fun addRunCoins(amount: Float) {
+        runCoins = ModRules.runCoins(runCoins, amount)
+    }
+
     /** Общая часть переноса: не симулируем пропущенные метры и не выдаём награду за босса. */
     private fun teleportTo(targetY: Float) {
         py = targetY
@@ -464,8 +485,22 @@ class Sim {
 
     // ---------- шаг ----------
 
+    /** MOD: простой автопилот — прыжок от стены и добирание в воздухе. */
+    private fun autoPilot() {
+        if (inCannon != null) {
+            fireCannon()
+            return
+        }
+        if (onWall) {
+            jump()
+            return
+        }
+        if (jumpsLeft > 0 && pvy > -40f) airJump(-side)
+    }
+
     fun step(dt: Float) {
         if (dead) return
+        if (autoPlay) autoPilot()
         val prevTime = time
         time += dt
         squash += (0f - squash) * min(1f, dt * 9f)
@@ -488,7 +523,7 @@ class Sim {
         } else if (onWall) {
             // секунду висит намертво, потом срывается и быстро падает, пока не прыгнешь
             val before = gripT
-            gripT += dt
+            if (!noSlip) gripT += dt else { gripT = 0f; wallVy = 0f }
             if (gripT > Phys.GRIP_TIME) {
                 if (before <= Phys.GRIP_TIME) events.add(Ev(Ev.SLIP, px, py))
                 wallVy = min(wallVy + Phys.FALL_ACC * dt, Phys.FALL_MAX)
@@ -502,10 +537,11 @@ class Sim {
                 pvy = wallVy
             }
         } else {
+            val grav = Phys.GRAV * (if (gravityMul.isFinite()) gravityMul.coerceIn(0.05f, 3f) else 1f)
             val g = when {
-                boostT > 0f -> Phys.GRAV * 0.12f
-                flyMode -> Phys.GRAV * 0.22f
-                else -> Phys.GRAV
+                boostT > 0f -> grav * 0.12f
+                flyMode -> grav * 0.22f
+                else -> grav
             }
             boostT = max(0f, boostT - dt)
             pvy = min(pvy + g * dt, 950f)
@@ -539,8 +575,10 @@ class Sim {
                 lavaY = a!!.bottom + 50f
             } else {
                 val height = -minPy
-                lavaY -= (30f + min(70f, height / 20f)) * lavaMul * dt
-                lavaY = min(lavaY, py + 500f)
+                if (!lavaPaused) {
+                    lavaY -= (30f + min(70f, height / 20f)) * lavaMul * dt
+                    lavaY = min(lavaY, py + 500f)
+                }
             }
             if (!godMode && !noCollision && shield <= 0f && py + hr > lavaY) return die("Тилкайо сгорел в лаве 🔥")
         }
@@ -920,6 +958,7 @@ class Sim {
         }
 
         // патроны: появляются редко, пока босс дерётся
+        if (ammoInfinite && b.state != Boss.DEAD) ammo = max(ammo, 3)
         if (b.state != Boss.ENTER) {
             ammoTimer -= dt
             if (ammoTimer <= 0f) {

@@ -18,6 +18,20 @@ object ModRules {
     /** Рекорд высоты в метрах: 0,1–100 000. */
     fun parseRecord(text: String): Int? = parseMeters(text)?.toInt()
 
+    /** Множитель гравитации: 0,05–3 (меньше единицы — прыжки выше). */
+    fun validGravity(value: Float) = value.isFinite() && value in 0.05f..3f
+
+    fun gravityFor(moonJump: Boolean) = if (moonJump) 0.35f else 1f
+
+    /** Метры вниз: положительное число означает «ниже». */
+    fun teleportedDownY(y: Float, meters: Float): Float {
+        require(validMeters(meters))
+        return y + meters * 10f
+    }
+
+    /** Монеты в текущий забег. */
+    fun runCoins(current: Float, amount: Float) = current + amount.coerceIn(0f, 1_000_000f)
+
     /** Награда с учётом множителя; некорректный множитель не портит начисление. */
     fun runReward(base: Float, mul: Float) = base * (if (mul.isFinite() && mul >= 0f) mul else 1f)
     fun parseMeters(text: String): Float? = text.trim().replace(',', '.').toFloatOrNull()?.takeIf { validMeters(it) }
