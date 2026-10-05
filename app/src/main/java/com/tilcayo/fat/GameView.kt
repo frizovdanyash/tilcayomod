@@ -1,5 +1,13 @@
 package com.tilcayo.fat
 
+import android.app.AlertDialog
+import android.text.InputType
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.Switch
+import android.widget.Button
+import android.widget.TextView
 import android.animation.ArgbEvaluator
 import android.content.Context
 import android.graphics.Bitmap
@@ -134,6 +142,9 @@ class GameView(context: Context) : View(context) {
     private var anim = 0f
     private var last = System.nanoTime()
     private var paused = false
+    private var modMenuOpen = false
+    private var modDialog: AlertDialog? = null
+    private val mod = ModSettings(context)
     private val buttons = ArrayList<Btn>()
     private var toastText = ""
     private var toastT = 0f
@@ -216,6 +227,7 @@ class GameView(context: Context) : View(context) {
     }
 
     fun release() {
+        modDialog?.dismiss()
         music.release()
         sfx.release()
     }
@@ -268,7 +280,7 @@ class GameView(context: Context) : View(context) {
             Scene.MENU -> drawMenu(c)
             Scene.FARM -> drawFarm(c, dt)
             Scene.PLAY, Scene.DEAD -> {
-                if (scene == Scene.PLAY && !paused) {
+                if (scene == Scene.PLAY && !paused && !modMenuOpen) {
                     var rem = dt
                     while (rem > 0f) {
                         val s = min(rem, 1f / 120f)
@@ -283,6 +295,7 @@ class GameView(context: Context) : View(context) {
                 if (paused) drawPause(c)
             }
         }
+        drawModButton(c)
         postInvalidateOnAnimation()
     }
 
@@ -294,6 +307,13 @@ class GameView(context: Context) : View(context) {
         if (e.actionMasked != MotionEvent.ACTION_DOWN && e.actionMasked != MotionEvent.ACTION_POINTER_DOWN) return true
         val rx = e.getX(e.actionIndex)
         val ry = e.getY(e.actionIndex)
+        val ux = (rx - uiOx) / ui
+        val uy = (ry - uiOy) / ui
+        if (ux in 276f..350f && uy in 132f..174f) {
+            showModMenu()
+            return true
+        }
+        if (modMenuOpen) return true
         if (scene == Scene.PLAY && !paused) {
             val wx = rx / scale
             val wy = ry / scale
@@ -305,8 +325,6 @@ class GameView(context: Context) : View(context) {
             }
             return true
         }
-        val ux = (rx - uiOx) / ui
-        val uy = (ry - uiOy) / ui
         if (scene == Scene.DEAD && sceneTime < 0.5f) return true
         val hit = buttons.asReversed().firstOrNull { ux >= it.x && ux <= it.x + it.w && uy >= it.y && uy <= it.y + it.h }
         if (hit != null) {
@@ -319,11 +337,139 @@ class GameView(context: Context) : View(context) {
         return true
     }
 
+    // Мод-меню не меняет paused: закрытие сохраняет предыдущую паузу.
+    private fun drawModButton(c: Canvas) {
+        c.save()
+        c.translate(uiOx, uiOy)
+        c.scale(ui, ui)
+        panel(c, 276f, 132f, 74f, 42f, 0xEE00897B.toInt(), 12f)
+        text(c, "MOD", 313f, 160f, 20f)
+        c.restore()
+    }
+
+    private fun showModMenu() {
+        if (modMenuOpen) return
+        modMenuOpen = true
+        val pad = (16 * resources.displayMetrics.density).toInt()
+        val content = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad / 2, pad, pad)
+        }
+        fun label(value: String) {
+            content.addView(TextView(context).apply { text = value; setPadding(0, pad / 2, 0, pad / 2) })
+        }
+        fun toggle(title: String, checked: Boolean, action: (Boolean) -> Unit) {
+            content.addView(Switch(context).apply {
+                text = title
+                isChecked = checked
+                setOnCheckedChangeListener { _, enabled -> action(enabled); mod.save() }
+            })
+        }
+        fun action(title: String, task: () -> Unit) {
+            content.addView(Button(context).apply { text = title; setOnClickListener { task() } })
+        }
+        label("Офлайн-мод · настройки сохраняются. Во время открытия забег заморожен.")
+        toggle("Бессмертие", mod.godMode) { mod.godMode = it }
+        toggle("Сквозь препятствия (стены остаются)", mod.noCollision) {
+            mod.noCollision = it
+            if (it && scene == Scene.PLAY) {
+                cling = null; inCannon = null
+                onWall = false; jumpsLeft = MAX_AIR
+            }
+        }
+        toggle("Бесконечные прыжки в воздухе", mod.infiniteJumps) { mod.infiniteJumps = it }
+        label("Телепорт вверх на N метров (1 м = 10 единиц). Только в забеге; от 0,1 до 100 000 м.")
+        val distance = EditText(context).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setSingleLine(true)
+            setText(mod.teleportMeters.toString())
+            hint = "Расстояние в метрах"
+        }
+        content.addView(distance)
+        action("ТЕЛЕПОРТ ВПЕРЁД / ВВЕРХ") {
+            val meters = ModRules.parseMeters(distance.text.toString())
+            when {
+                scene != Scene.PLAY -> distance.error = "Сначала начните забег"
+                meters == null -> distance.error = "Введите число от 0,1 до 100 000"
+                else -> {
+                    mod.teleportMeters = meters; mod.save()
+                    teleportForward(meters)
+                    modDialog?.dismiss()
+                }
+            }
+        }
+        label("Ферма: перед первым изменением создаётся копия прогресса. Бонусы сохраняются, откат — кнопкой ниже.")
+        val status = TextView(context)
+        content.addView(status)
+        fun farmChange(message: String, change: () -> Unit) {
+            save.backupForMod()
+            change()
+            save.save()
+            if (scene == Scene.PLAY) coinMul = save.coinMultiplier()
+            status.text = message
+        }
+        action("+100 000 МОНЕТ") {
+            farmChange("Монеты: ${ModRules.addCoins(save.coins, 100_000L)}") {
+                save.coins = ModRules.addCoins(save.coins, 100_000L)
+            }
+        }
+        action("ВЫБРАННЫЙ ТИЛКАЙО: УРОВЕНЬ 10") {
+            farmChange("Выбранный тилкайо: уровень 10") { save.herd[save.selected] = Balance.MAX_FAT }
+        }
+        action("СТАДО: 9 ТИЛКАЙО, ВСЕ УРОВНЯ 10") {
+            farmChange("Стадо заполнено и откормлено") {
+                while (save.herd.size < Balance.MAX_HERD) save.herd.add(0)
+                for (i in save.herd.indices) save.herd[i] = Balance.MAX_FAT
+            }
+        }
+        action("ВОССТАНОВИТЬ ПРОГРЕСС ДО БОНУСОВ") {
+            if (scene == Scene.PLAY) {
+                status.text = "Для восстановления сначала выйдите из забега в меню"
+            } else {
+                status.text = if (save.restoreModBackup()) "Прогресс восстановлен" else "Резервной копии ещё нет"
+                farmFoods.clear()
+                syncPets()
+            }
+        }
+        label("Бонус уровня меняет размер бегуна со следующего забега. Телепорт не собирает пропущенные монеты; даёт щит на 2 секунды.")
+        modDialog = AlertDialog.Builder(context)
+            .setTitle("Тилкайо · MOD")
+            .setView(ScrollView(context).apply { addView(content) })
+            .setPositiveButton("ЗАКРЫТЬ", null)
+            .create().also { dialog ->
+                dialog.setOnDismissListener { modMenuOpen = false; modDialog = null; last = System.nanoTime() }
+                dialog.show()
+            }
+    }
+
+    private fun teleportForward(meters: Float) {
+        if (scene != Scene.PLAY || !ModRules.validMeters(meters)) return
+        py = ModRules.teleportedY(py, meters)
+        px = stickX(-1)
+        pvx = 0f; pvy = 0f
+        side = -1; face = 1
+        onWall = true; cling = null; inCannon = null
+        cannonT = 0f; boostT = 0f; jumpBuf = 0f; jumpsLeft = MAX_AIR
+        shield = max(shield, 2f)
+        minPy = min(minPy, py)
+        camY = py - viewH * 0.62f
+        lavaY = py + 440f
+        // Генерируем только новое видимое окно, а не весь пропущенный путь.
+        coins.clear(); snacks.clear(); spikes.clear(); saws.clear(); orbits.clear(); lasers.clear()
+        pillars.clear(); cannons.clear(); bumpers.clear(); particles.clear(); pops.clear()
+        genY = camY + viewH + 200f
+        lastCannonH = -py
+        calmUntil = py - 200f
+        while (genY > camY - 800f) genChunk()
+        ring(px, py, 0xFF64FFDA.toInt())
+        sfx.play(Sfx.S.SHIELD)
+    }
+
     private fun onTapPlay(wx: Float) {
         when {
             inCannon != null -> fireCannon()
             onWall -> jump()
-            jumpsLeft > 0 -> airJump(if (wx < W / 2) -1 else 1)
+            jumpsLeft > 0 || mod.infiniteJumps -> airJump(if (wx < W / 2) -1 else 1)
             else -> jumpBuf = 0.2f
         }
     }
@@ -388,7 +534,7 @@ class GameView(context: Context) : View(context) {
     }
 
     private fun airJump(d: Int) {
-        jumpsLeft--
+        if (!mod.infiniteJumps) jumpsLeft--
         face = d
         pvx = d * JUMP_VX
         pvy = -AIR_VY
@@ -472,7 +618,7 @@ class GameView(context: Context) : View(context) {
             if (boostT > 0f && rnd.nextFloat() < 0.6f) {
                 particles.add(Particle(px, py, (rnd.nextFloat() - 0.5f) * 40f, 40f, 0.4f, 0.4f, 0xFFFFB74D.toInt(), 3f + rnd.nextFloat() * 3f))
             }
-            collidePillars()
+            if (!mod.noCollision) collidePillars()
             if (!onWall) collideScreenWalls()
         }
         if (py < minPy) minPy = py
@@ -485,12 +631,12 @@ class GameView(context: Context) : View(context) {
         val height = -minPy
         lavaY -= (30f + min(70f, height / 20f)) * dt
         lavaY = min(lavaY, py + 500f)
-        if (shield <= 0f && py + hr > lavaY) return die("Тилкайо сгорел в лаве 🔥")
+        if (!mod.godMode && !mod.noCollision && shield <= 0f && py + hr > lavaY) return die("Тилкайо сгорел в лаве 🔥")
         if (py - hr > camY + viewH + 20f) return die("Упал вниз 😵")
 
         while (genY > camY - 800f) genChunk()
 
-        val invuln = shield > 0f || inCannon != null
+        val invuln = mod.godMode || mod.noCollision || shield > 0f || inCannon != null
         checkHazards(dt, invuln)
         if (scene != Scene.PLAY) return
         checkPickups()
@@ -574,7 +720,7 @@ class GameView(context: Context) : View(context) {
             if (s.y < s.y0) { s.y = s.y0; s.vy = abs(s.vy) }
             if (s.y > s.y1) { s.y = s.y1; s.vy = -abs(s.vy) }
             s.ang += dt * 9f
-            if (inCannon != null) continue
+            if (inCannon != null || mod.noCollision || (mod.godMode && shield <= 0f)) continue
             val dx = s.x - px
             val dy = s.y - py
             val rr = hr + 13f
@@ -587,7 +733,7 @@ class GameView(context: Context) : View(context) {
         }
         for (o in orbits) {
             o.a += o.spd * dt
-            if (inCannon != null) continue
+            if (inCannon != null || mod.noCollision || (mod.godMode && shield <= 0f)) continue
             for (i in 0 until o.n) {
                 if (!o.alive[i]) continue
                 val a = o.a + i * 2f * PI.toFloat() / o.n
@@ -614,7 +760,7 @@ class GameView(context: Context) : View(context) {
             val dy = py - b.y
             val rr = hr + 17f
             val d2 = dx * dx + dy * dy
-            if (d2 < rr * rr && b.pop <= 0f && inCannon == null) {
+            if (d2 < rr * rr && b.pop <= 0f && inCannon == null && !mod.noCollision) {
                 val d = max(1f, sqrt(d2))
                 pvx = dx / d * 500f
                 pvy = dy / d * 500f - 140f
@@ -628,7 +774,7 @@ class GameView(context: Context) : View(context) {
             }
         }
         // пушки
-        if (inCannon == null && boostT <= 0f) {
+        if (inCannon == null && boostT <= 0f && !mod.noCollision) {
             for (cn in cannons) {
                 if (cn.used) continue
                 if (hypot(cn.x - px, cn.y - py) < 30f) {
@@ -689,6 +835,20 @@ class GameView(context: Context) : View(context) {
     }
 
     private fun die(reason: String) {
+        if (mod.godMode || mod.noCollision) {
+            // Не оставляем бессмертного игрока за нижним краем камеры.
+            if (py - hr > camY + viewH + 20f) {
+                py = camY + viewH * 0.62f
+                px = stickX(-1)
+                onWall = true
+                cling = null
+                inCannon = null
+                pvx = 0f; pvy = 0f
+                jumpsLeft = MAX_AIR
+                lavaY = py + 440f
+            }
+            return
+        }
         deathReason = reason
         scene = Scene.DEAD
         sceneTime = 0f

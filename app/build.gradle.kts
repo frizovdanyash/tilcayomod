@@ -8,11 +8,11 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.tilcayo.fat"
+        applicationId = "com.tilcayo.fat.mod"
         minSdk = 24
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "1.1-mod.1"
     }
 
     buildTypes {
@@ -27,3 +27,5 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
 }
+
+dependencies { testImplementation("junit:junit:4.13.2") }

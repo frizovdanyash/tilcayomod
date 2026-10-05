@@ -68,6 +68,29 @@ class SaveData(context: Context) {
         return got
     }
 
+    /** Единственная копия до первой выдачи мод-бонусов; не перезаписывается. */
+    fun backupForMod() {
+        if (sp.contains("mod_backup_herd")) return
+        sp.edit().putString("mod_backup_herd", herd.joinToString(","))
+            .putLong("mod_backup_coins", coins).putInt("mod_backup_selected", selected)
+            .putInt("mod_backup_best", best).putLong("mod_backup_collect", lastCollect).commit()
+    }
+
+    fun restoreModBackup(): Boolean {
+        val raw = sp.getString("mod_backup_herd", null) ?: return false
+        val restored = raw.split(",").mapNotNull { it.toIntOrNull() }
+        if (restored.isEmpty()) return false
+        herd.clear(); herd.addAll(restored)
+        coins = sp.getLong("mod_backup_coins", 50L)
+        selected = sp.getInt("mod_backup_selected", 0).coerceIn(0, herd.lastIndex)
+        best = sp.getInt("mod_backup_best", 0)
+        lastCollect = sp.getLong("mod_backup_collect", System.currentTimeMillis())
+        save()
+        sp.edit().remove("mod_backup_herd").remove("mod_backup_coins")
+            .remove("mod_backup_selected").remove("mod_backup_best").remove("mod_backup_collect").apply()
+        return true
+    }
+
     fun save() {
         sp.edit()
             .putLong("coins", coins)
