@@ -130,6 +130,7 @@ class BossTest {
             var n = 0
             while (n++ < 240 && sim.bullets.isNotEmpty()) {
                 sim.shield = 9f
+                sim.gripT = 0f; sim.wallVy = 0f // держим игрока на стене, чтобы он не срывался
                 if (angry) { b.t = 0f }
                 sim.step(1f / 60f)
             }
@@ -218,5 +219,54 @@ class BossTest {
         }
         lines.forEach { println(it) }
         println("BOSS total wins=$wins/$total")
+    }
+}
+
+class RingFairnessTest {
+    /** Кольцо пуха оставляет проход: в нём можно стоять, в остальных направлениях — нет. */
+    @Test
+    fun ringHasASafeGapAndOnlyThere() {
+        var aliveInGap = 0
+        var deadElsewhere = 0
+        for (phase in intArrayOf(0, 2, 4)) {
+            for (seed in 1..6) {
+                for (inGap in booleanArrayOf(true, false)) {
+                    val sim = Sim()
+                    sim.reset(5, 1f, 800f)
+                    sim.startRush(5 + phase)
+                    var guard = 0
+                    while (guard++ < 3000 && sim.boss?.state != Boss.HOVER) { sim.shield = 9f; sim.py = sim.arena!!.bottom - 100f; sim.step(1f / 60f) }
+                    val b = sim.boss!!
+                    b.hp = b.hpMax - phase
+                    b.seed = seed * 7919
+                    sim.shield = 0f
+                    // принудительно запускаем кольцо
+                    b.attack = 1
+                    val m = Sim::class.java.getDeclaredMethod("chooseAttack", Boss::class.java, Int::class.javaPrimitiveType)
+                    m.isAccessible = true
+                    b.state = Boss.HOVER
+                    // chooseAttack выбирает случайно — крутим, пока не выпадет кольцо
+                    var tries = 0
+                    while (b.state != Boss.VOLLEY_TELE && tries++ < 50) { b.state = Boss.HOVER; m.invoke(sim, b, phase) }
+                    assert(b.state == Boss.VOLLEY_TELE)
+                    // стоим на расстоянии 150 от босса в направлении прохода (или напротив)
+                    val dirA = if (inGap) b.gapAng else b.gapAng + Math.PI.toFloat() / 2f + 0.3f
+                    var t = 0f
+                    while (t < 4f && !sim.dead) {
+                        sim.onWall = false
+                        sim.px = (b.x + kotlin.math.cos(dirA) * 150f)
+                        sim.py = (b.y + kotlin.math.sin(dirA) * 150f)
+                        sim.pvx = 0f; sim.pvy = 0f
+                        sim.step(1f / 60f)
+                        t += 1f / 60f
+                    }
+                    if (inGap && !sim.dead) aliveInGap++
+                    if (!inGap && sim.dead) deadElsewhere++
+                }
+            }
+        }
+        println("RING aliveInGap=$aliveInGap/18 deadElsewhere=$deadElsewhere/18")
+        assert(aliveInGap == 18)
+        assert(deadElsewhere >= 15)
     }
 }

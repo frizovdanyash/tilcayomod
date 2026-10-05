@@ -543,6 +543,10 @@ class GameView(context: Context) : View(context) {
                     sfx.play(Sfx.S.AIR, 1f + (MAX_AIR - sim.jumpsLeft) * 0.12f)
                     ring(ev.x, ev.y, 0xFF9BE7FF.toInt())
                 }
+                Ev.SLIP -> {
+                    sfx.play(Sfx.S.SLIP)
+                    dust(ev.x, ev.y, 6, 0xFFFFC0A0.toInt())
+                }
                 Ev.LAND -> {
                     sfx.play(Sfx.S.LAND, 0.9f + rnd.nextFloat() * 0.2f, 0.7f)
                     dust(ev.x - sim.side * sim.r * 0.3f, ev.y, 8, 0xFFE0D6FF.toInt())
@@ -752,6 +756,7 @@ class GameView(context: Context) : View(context) {
 
     private fun drawBackground(c: Canvas, top: Int, bottom: Int, scroll: Float, withStars: Boolean = true) {
         p.style = Paint.Style.FILL
+        p.color = 0xFF000000.toInt() // альфа краски домножается на шейдер, поэтому она обязана быть непрозрачной
         p.shader = LinearGradient(0f, 0f, 0f, height.toFloat(), top, bottom, Shader.TileMode.CLAMP)
         c.drawRect(0f, 0f, width.toFloat(), height.toFloat(), p)
         p.shader = null
@@ -1169,7 +1174,25 @@ class GameView(context: Context) : View(context) {
             val sx = 1f + squash * 0.22f - stretch
             val sy = 1f - squash * 0.22f + stretch
             val faceDir = if (onWall) -side else face
-            drawTilcayo(c, px, py, r, faceDir, rot, sx, sy, runLevel, runSkin)
+            // перед срывом тилкайо дрожит, вокруг него тает кольцо «хватки»
+            val g = (sim.gripT / Phys.GRIP_TIME)
+            val tremble = if (onWall && g > 0.7f) sin(anim * 70f) * (min(1f, g) - 0.7f) * 7f else 0f
+            drawTilcayo(c, px + tremble, py, r, faceDir, rot, sx, sy, runLevel, runSkin)
+            if (onWall) {
+                val ringR = r * 1.4f
+                rect.set(px - ringR, py - ringR, px + ringR, py + ringR)
+                p.style = Paint.Style.STROKE
+                p.strokeWidth = 3.5f
+                if (g < 1f) {
+                    p.color = lerpColor(0xFF00E676.toInt(), 0xFFFF1744.toInt(), g)
+                    c.drawArc(rect, -90f, 360f * (1f - g), false, p)
+                } else if ((anim * 12f).toInt() % 2 == 0) {
+                    p.color = 0xFFFF1744.toInt()
+                    c.drawArc(rect, -90f, 360f, false, p)
+                }
+                p.style = Paint.Style.FILL
+                if (g >= 1f) text(c, "⬇", px, py + r * 2.2f, 18f, 0xFFFF8A80.toInt(), shadow = false)
+            }
             if (shield > 0f && (shield > 0.8f || (anim * 10f).toInt() % 2 == 0)) {
                 p.style = Paint.Style.FILL
                 p.color = 0x3355CCFF
@@ -1237,6 +1260,25 @@ class GameView(context: Context) : View(context) {
                 c.drawRect(b.cols[i] - 15f, a.top, b.cols[i] + 15f, a.bottom, p)
                 text(c, "!", b.cols[i], a.top + 40f, 30f, 0xFFFF1744.toInt(), shadow = false)
             }
+        }
+        if (b.state == Boss.VOLLEY_TELE) {
+            // красное кольцо и зелёная дуга-проход: лети в неё
+            val rr = 100f
+            val half = Math.toDegrees(Boss.gapHalf(phase).toDouble()).toFloat()
+            val gap = Math.toDegrees(b.gapAng.toDouble()).toFloat()
+            rect.set(b.x - rr, b.y - rr, b.x + rr, b.y + rr)
+            p.style = Paint.Style.STROKE
+            p.strokeWidth = 7f
+            val blink = if ((anim * 10f).toInt() % 2 == 0) 0xAAFF1744.toInt() else 0x55FF1744
+            p.color = blink
+            c.drawArc(rect, gap + half, 360f - 2f * half, false, p)
+            p.color = 0xEE00E676.toInt()
+            p.strokeWidth = 9f
+            c.drawArc(rect, gap - half, 2f * half, false, p)
+            p.style = Paint.Style.FILL
+            val ax = b.x + cos(b.gapAng) * (rr + 24f)
+            val ay = b.y + sin(b.gapAng) * (rr + 24f)
+            text(c, "▼", ax, ay + 8f, 18f, 0xFF00E676.toInt(), shadow = false)
         }
         if (b.state == Boss.CHARGE_WARN || b.state == Boss.CHARGE_MOVE) {
             val blink = if ((anim * 12f).toInt() % 2 == 0) 0x66FF1744 else 0x22FF1744
@@ -1416,9 +1458,10 @@ class GameView(context: Context) : View(context) {
     private fun drawNight(c: Canvas) {
         val cx = sim.px * scale
         val cy = (sim.py - sim.camY) * scale
-        val r = 200f * scale
+        val r = 230f * scale
         p.style = Paint.Style.FILL
-        p.shader = RadialGradient(cx, cy, r, intArrayOf(0x00000000, 0x00000000, 0xF5000000.toInt()), floatArrayOf(0f, 0.42f, 1f), Shader.TileMode.CLAMP)
+        p.color = 0xFF000000.toInt()
+        p.shader = RadialGradient(cx, cy, r, intArrayOf(0x00000000, 0x00000000, 0xF5000000.toInt()), floatArrayOf(0f, 0.46f, 1f), Shader.TileMode.CLAMP)
         c.drawRect(0f, 0f, width.toFloat(), height.toFloat(), p)
         p.shader = null
     }
@@ -1652,7 +1695,7 @@ class GameView(context: Context) : View(context) {
         } else if (bossHint > 0f && bs != null) {
             val ha = min(1f, bossHint).coerceIn(0f, 1f)
             text(c, "Пока он спокоен — коснись его! Злого не трогай", W / 2, viewH * 0.8f, 15f, ((ha * 255).toInt() shl 24) or 0xFFFFFF, maxW = 340f)
-            text(c, "Подбирай патроны и стреляй издалека", W / 2, viewH * 0.8f + 20f, 13f, ((ha * 255).toInt() shl 24) or 0xFFFFE082.toInt().and(0xFFFFFF), maxW = 340f)
+            text(c, "Кольцо пуха: лети в зелёный проход. Патроны — для стрельбы", W / 2, viewH * 0.8f + 20f, 13f, ((ha * 255).toInt() shl 24) or 0xFFFFE082.toInt().and(0xFFFFFF), maxW = 340f)
         }
         // кнопка паузы
         panel(c, W - 48f, 14f, 36f, 36f, 0x77000000, 18f)
@@ -1668,6 +1711,7 @@ class GameView(context: Context) : View(context) {
             text(c, "ТАП — прыжок на другую стену", W / 2, viewH * 0.78f, 17f, col, maxW = 320f)
             text(c, "в воздухе ещё 2 рывка:", W / 2, viewH * 0.78f + 24f, 14f, col, maxW = 320f)
             text(c, "ТАП — вперёд  ·  СВАЙП ← → — в сторону", W / 2, viewH * 0.78f + 44f, 14f, col, maxW = 320f)
+            text(c, "на стене держишься ~1 сек, потом срываешься!", W / 2, viewH * 0.78f + 68f, 14f, ((a * 255).toInt() shl 24) or 0xFFAB91, maxW = 330f)
         }
         c.restore()
     }

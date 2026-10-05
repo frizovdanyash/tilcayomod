@@ -2,6 +2,7 @@ package com.tilcayo.fat
 
 import java.util.PriorityQueue
 import kotlin.math.abs
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
@@ -31,6 +32,8 @@ class Solver(private val sim: Sim) {
         k = k * 7 + s.clingIdx + 1
         k = k * 997 + kt
         k = k * 3 + (if (s.bumpCd > 0f) 1 else 0)
+        k = k * 13 + min(12, (s.gripT / 0.1f + 0.5f).toInt())
+        k = k * 11 + (s.wallVy / 70f).roundToInt()
         return k
     }
 

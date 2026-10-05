@@ -1,6 +1,6 @@
 {
-  "versionCode": 6,
-  "versionName": "1.5",
+  "versionCode": 7,
+  "versionName": "1.6",
   "apk": "https://github.com/narezy/tilcayo/raw/main/apk/tilcayo.apk",
-  "notes": "Босс-раш, патроны против босса, модификаторы забега, проверка обновлений"
+  "notes": "Хватка на стене, новое кольцо пуха у босса, исправлена мигающая ночь"
 }

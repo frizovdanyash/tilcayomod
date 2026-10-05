@@ -22,7 +22,10 @@ object Phys {
     const val JUMP_VX = 320f
     const val AIR_VY = 470f
     const val MAX_AIR = 2
-    const val SLIDE = 45f
+    /** Сколько тилкайо намертво держится на стене, прежде чем начать срываться. */
+    const val GRIP_TIME = 1.0f
+    const val FALL_ACC = 1400f
+    const val FALL_MAX = 650f
     const val TAU = (2.0 * PI).toFloat()
 
     fun radius(level: Int) = 15f + level * 1.7f
@@ -114,6 +117,8 @@ class Boss(val hpMax: Int) {
     var dodgeT = 0f
     var dodgeCd = 1.2f
     var dodgeDir = 1
+    /** Направление безопасного прохода в кольце пуха. */
+    var gapAng = 0f
 
     fun rand(): Float {
         seed = seed * 1103515245 + 12345
@@ -124,7 +129,7 @@ class Boss(val hpMax: Int) {
         val b = Boss(hpMax)
         b.x = x; b.y = y; b.hp = hp; b.state = state; b.t = t; b.hover = hover; b.stun = stun; b.flash = flash
         b.attack = attack; b.dir = dir; b.fired = fired; b.seed = seed; b.tx = tx; b.face = face
-        b.off = off; b.dodgeT = dodgeT; b.dodgeCd = dodgeCd; b.dodgeDir = dodgeDir
+        b.gapAng = gapAng; b.off = off; b.dodgeT = dodgeT; b.dodgeCd = dodgeCd; b.dodgeDir = dodgeDir
         cols.copyInto(b.cols)
         return b
     }
@@ -134,6 +139,9 @@ class Boss(val hpMax: Int) {
 
         /** Босс злой во время атак: тогда касание смертельно, а пули отскакивают. */
         fun angry(state: Int) = state in VOLLEY_TELE..RAIN_FALL
+
+        /** Половина угла безопасного прохода (рад). С каждым ударом проход чуть уже. */
+        fun gapHalf(phase: Int) = max(0.45f, 0.66f - 0.035f * phase)
         const val ENTER = 0
         const val HOVER = 1
         const val VOLLEY_TELE = 2
@@ -171,6 +179,7 @@ class Ev(val type: Int, val x: Float = 0f, val y: Float = 0f, val ref: Any? = nu
         const val AMMO = 16
         const val SHOOT = 17
         const val BULLET_BLOCK = 18
+        const val SLIP = 19
     }
 }
 
@@ -178,6 +187,7 @@ class Snap(
     val px: Float, val py: Float, val pvx: Float, val pvy: Float,
     val side: Int, val face: Int, val onWall: Boolean, val clingIdx: Int,
     val jumpsLeft: Int, val jumpBuf: Float, val boostT: Float, val time: Float, val bumpCd: Float,
+    val gripT: Float = 0f, val wallVy: Float = 0f,
 )
 
 /** Снимок, который включает босса и снаряды (для тестов-ботов). */
@@ -216,6 +226,9 @@ class Sim {
     var inCannon: Cannon? = null
     var cannonT = 0f
     var bumpCd = 0f
+    /** Сколько секунд тилкайо уже на стене и как быстро он срывается вниз. */
+    var gripT = 0f
+    var wallVy = 0f
     var level = 1
     var r = 16f
     var hr = 9f
@@ -283,6 +296,8 @@ class Sim {
         shield = 0f
         boostT = 0f
         bumpCd = 0f
+        gripT = 0f
+        wallVy = 0f
         time = 0f
         camY = py - viewH * 0.62f
         lavaY = py + 440f
@@ -309,7 +324,7 @@ class Sim {
 
     // ---------- снимок для решателя ----------
 
-    fun save() = Snap(px, py, pvx, pvy, side, face, onWall, if (cling == null) -1 else pillars.indexOf(cling!!), jumpsLeft, jumpBuf, boostT, time, bumpCd)
+    fun save() = Snap(px, py, pvx, pvy, side, face, onWall, if (cling == null) -1 else pillars.indexOf(cling!!), jumpsLeft, jumpBuf, boostT, time, bumpCd, gripT, wallVy)
 
     fun saveFull() = FullState(
         save(), boss?.copy(), hairs.map { it.copy() }, camY, lavaY, minPy, runCoins, shield, arena?.active == true, dead,
@@ -335,6 +350,7 @@ class Sim {
         side = s.side; face = s.face; onWall = s.onWall
         cling = if (s.clingIdx < 0) null else pillars[s.clingIdx]
         jumpsLeft = s.jumpsLeft; jumpBuf = s.jumpBuf; boostT = s.boostT; time = s.time; bumpCd = s.bumpCd
+        gripT = s.gripT; wallVy = s.wallVy
         shield = 0f; inCannon = null; squash = 0f; dead = false
     }
 
@@ -368,6 +384,8 @@ class Sim {
         onWall = true
         pvx = 0f
         pvy = 0f
+        gripT = 0f
+        wallVy = 0f
         squash = 1f
         jumpsLeft = Phys.MAX_AIR
         events.add(Ev(Ev.LAND, px, py))
@@ -410,13 +428,20 @@ class Sim {
             py = cn.y
             if (cannonT > 2.4f) fireCannon()
         } else if (onWall) {
-            py += Phys.SLIDE * dt
+            // секунду висит намертво, потом срывается и быстро падает, пока не прыгнешь
+            val before = gripT
+            gripT += dt
+            if (gripT > Phys.GRIP_TIME) {
+                if (before <= Phys.GRIP_TIME) events.add(Ev(Ev.SLIP, px, py))
+                wallVy = min(wallVy + Phys.FALL_ACC * dt, Phys.FALL_MAX)
+                py += wallVy * dt
+            }
             val pl = cling
             if (pl != null && py - hr * 0.3f > pl.y1) {
                 onWall = false
                 cling = null
                 pvx = 0f
-                pvy = 60f
+                pvy = wallVy
             }
         } else {
             val g = if (boostT > 0f) Phys.GRAV * 0.12f else Phys.GRAV
@@ -630,7 +655,13 @@ class Sim {
         b.t = 0f
         b.fired = 0
         b.state = when (next) {
-            0 -> Boss.VOLLEY_TELE
+            0 -> {
+                // безопасный проход — рядом с игроком, но не точно на нём: надо чуть сместиться
+                val toP = kotlin.math.atan2(py - b.y, px - b.x)
+                val off = (0.4f + 0.5f * b.rand()) * (if (b.rand() < 0.5f) -1f else 1f)
+                b.gapAng = toP + off
+                Boss.VOLLEY_TELE
+            }
             1 -> { b.dir = if (b.rand() < 0.5f) 1 else -1; Boss.CHARGE_MOVE }
             else -> {
                 // три колонны дождя на расстоянии друг от друга
@@ -686,18 +717,28 @@ class Sim {
             }
             Boss.VOLLEY_TELE -> {
                 b.y = hoverY + sin(b.t * 30f) * 2f
-                if (b.t >= max(0.45f, 0.85f - 0.07f * phase)) { b.state = Boss.VOLLEY_FIRE; b.t = 0f; b.fired = 0 }
+                if (b.t >= max(0.75f, 1.1f - 0.06f * phase)) { b.state = Boss.VOLLEY_FIRE; b.t = 0f; b.fired = 0 }
             }
             Boss.VOLLEY_FIRE -> {
-                val n = min(8, 4 + phase)
-                if (b.t >= 0.14f * b.fired && b.fired < n) {
+                // кольцо пуха с проходом; позже — второе кольцо с тем же проходом
+                val waves = if (phase >= 2) 2 else 1
+                if (b.fired < waves && b.t >= 0.6f * b.fired) {
                     b.fired++
-                    val ang = kotlin.math.atan2(py - b.y, px - b.x) + (b.rand() - 0.5f) * 0.9f
-                    val sp = 235f + 14f * phase
-                    hairs.add(Hair(b.x, b.y, cos(ang) * sp, sin(ang) * sp, 0, 6f))
+                    val n = 18
+                    val step = Phys.TAU / n
+                    val half = Boss.gapHalf(phase)
+                    val sp = 150f + 8f * phase
+                    for (i in 0 until n) {
+                        val ang = b.gapAng + step / 2f + i * step
+                        var diff = (ang - b.gapAng) % Phys.TAU
+                        if (diff > Math.PI) diff -= Phys.TAU
+                        if (diff < -Math.PI) diff += Phys.TAU
+                        if (abs(diff) < half) continue
+                        hairs.add(Hair(b.x + cos(ang) * 28f, b.y + sin(ang) * 28f, cos(ang) * sp, sin(ang) * sp, 0, 6f))
+                    }
                     events.add(Ev(Ev.BOSS_FIRE, b.x, b.y))
                 }
-                if (b.fired >= n && b.t >= 0.14f * n + 0.35f) { b.state = Boss.HOVER; b.t = 0f }
+                if (b.fired >= waves && b.t >= 0.6f * (waves - 1) + 0.7f) { b.state = Boss.HOVER; b.t = 0f }
             }
             Boss.CHARGE_MOVE -> {
                 val tx = mid - b.dir * range
