@@ -85,6 +85,20 @@ class SaveData(context: Context) {
     /** Какие скины открыты (битовая маска). */
     var ownedSkins: Long = sp.getLong("ownedSkins", 1L) or 1L
 
+    /** Включённые модификаторы забега (битовая маска). */
+    var mods: Int = sp.getInt("mods", 0)
+
+    /** Лучшее время босс-раша по каждому боссу (мс, 0 — ещё не побеждён). */
+    val rushBest = LongArray(Bosses.all.size) { sp.getLong("rushBest$it", 0L) }
+
+    /** Проверка обновлений. */
+    var lastUpdateCheck: Long = sp.getLong("lastUpdateCheck", 0L)
+    var remoteCode: Int = sp.getInt("remoteCode", 0)
+    var remoteName: String = sp.getString("remoteName", "") ?: ""
+    var remoteNotes: String = sp.getString("remoteNotes", "") ?: ""
+    var remoteApk: String = sp.getString("remoteApk", "") ?: ""
+    var dismissedCode: Int = sp.getInt("dismissedCode", 0)
+
     /** Бесплатные боксы (за победу над боссом). */
     var freeBoxes: Int = sp.getInt("freeBoxes", 0)
 
@@ -191,23 +205,26 @@ class SaveData(context: Context) {
         return any
     }
 
-    /** Полный снимок до первого бонуса. Старые резервные копии мода 1.1 тоже читаются. */
+    /** Полный снимок прогресса до первого бонуса. Копии прошлых версий мода тоже читаются. */
     fun backupForMod() {
-        if (sp.contains("mod_backup_v2") || sp.contains("mod_backup_herd")) return
+        if (sp.contains("mod_backup_v3") || sp.contains("mod_backup_v2") || sp.contains("mod_backup_herd")) return
         val data = JSONObject().put("coins", coins).put("best", best).put("lastCollect", lastCollect)
             .put("unlocked", unlocked).put("activeFarm", activeFarm)
             .put("ownedSkins", ownedSkins).put("freeBoxes", freeBoxes)
+            .put("mods", mods)
+            .put("rushBest", JSONArray().also { arr -> for (v in rushBest) arr.put(v) })
         val all = JSONArray()
         for (f in farms) all.put(JSONObject().put("herd", JSONArray(f.herd)).put("skin", JSONArray(f.skin))
             .put("selected", f.selected).put("breedEnd", f.breedEnd))
         data.put("farms", all)
-        sp.edit().putString("mod_backup_v2", data.toString()).commit()
+        sp.edit().putString("mod_backup_v3", data.toString()).commit()
     }
 
+    /** Откат к снимку. Умеет читать копии формата 1.1 и 1.4. */
     fun restoreModBackup(): Boolean {
-        val raw = sp.getString("mod_backup_v2", null)
+        val raw = sp.getString("mod_backup_v3", null) ?: sp.getString("mod_backup_v2", null)
         if (raw != null) {
-            // Разбираем снимок целиком до изменения текущего прогресса.
+            // Сначала разбираем снимок целиком, только потом трогаем текущий прогресс.
             val data = try { JSONObject(raw) } catch (_: Exception) { return false }
             val restored = try {
                 val all = data.getJSONArray("farms")
@@ -237,24 +254,29 @@ class SaveData(context: Context) {
             activeFarm = data.optInt("activeFarm", 0).coerceIn(0, unlocked - 1)
             ownedSkins = data.optLong("ownedSkins", 1L) or 1L
             freeBoxes = data.optInt("freeBoxes", 0).coerceAtLeast(0)
+            mods = data.optInt("mods", 0)
+            val rb = data.optJSONArray("rushBest")
+            if (rb != null) for (i in rushBest.indices) rushBest[i] = if (i < rb.length()) rb.optLong(i, 0L) else 0L
         } else {
             val legacy = sp.getString("mod_backup_herd", null) ?: return false
             val restored = legacy.split(",").mapNotNull { it.toIntOrNull() }
             if (restored.isEmpty()) return false
             for (f in farms) { f.herd.clear(); f.skin.clear(); f.addPet(); f.selected = 0; f.breedEnd = 0L }
-            activeFarm = 0; unlocked = 1; ownedSkins = 1L; freeBoxes = 0
+            activeFarm = 0; unlocked = 1; ownedSkins = 1L; freeBoxes = 0; mods = 0
+            for (i in rushBest.indices) rushBest[i] = 0L
             farm.herd.clear(); farm.herd.addAll(restored.take(Balance.MAX_HERD)); farm.normalize()
             selected = sp.getInt("mod_backup_selected", 0).coerceIn(0, herd.lastIndex)
             coins = sp.getLong("mod_backup_coins", 50L); best = sp.getInt("mod_backup_best", 0)
             lastCollect = sp.getLong("mod_backup_collect", System.currentTimeMillis())
         }
         save()
-        sp.edit().remove("mod_backup_v2").remove("mod_backup_herd").remove("mod_backup_coins")
-            .remove("mod_backup_selected").remove("mod_backup_best").remove("mod_backup_collect").apply()
+        sp.edit().remove("mod_backup_v3").remove("mod_backup_v2").remove("mod_backup_herd")
+            .remove("mod_backup_coins").remove("mod_backup_selected").remove("mod_backup_best")
+            .remove("mod_backup_collect").apply()
         return true
     }
 
-    fun save() {
+    fun save() { 
         val e = sp.edit()
             .putLong("coins", coins)
             .putInt("best", best)
@@ -264,6 +286,14 @@ class SaveData(context: Context) {
             .putInt("activeFarm", activeFarm)
             .putLong("ownedSkins", ownedSkins)
             .putInt("freeBoxes", freeBoxes)
+            .putInt("mods", mods)
+            .putLong("lastUpdateCheck", lastUpdateCheck)
+            .putInt("remoteCode", remoteCode)
+            .putString("remoteName", remoteName)
+            .putString("remoteNotes", remoteNotes)
+            .putString("remoteApk", remoteApk)
+            .putInt("dismissedCode", dismissedCode)
+        for (i in rushBest.indices) e.putLong("rushBest$i", rushBest[i])
         for (i in farms.indices) {
             val sfx = if (i == 0) "" else "$i"
             val f = farms[i]

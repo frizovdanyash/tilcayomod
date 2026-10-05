@@ -91,7 +91,7 @@ private object Synth {
 }
 
 class Sfx(private val ctx: Context) {
-    enum class S { JUMP, AIR, LAND, COIN, EAT, CAN_IN, CAN_FIRE, SHIELD, SMASH, DEATH, RECORD, CLICK, BUY, LEVEL, BREED, BUMP, LASER, HOP, BOSS_ROAR, BOSS_HIT, BOSS_DEAD, WARN, BOX, REVEAL_C, REVEAL_R, REVEAL_E, REVEAL_L, THROW }
+    enum class S { JUMP, AIR, LAND, COIN, EAT, CAN_IN, CAN_FIRE, SHIELD, SMASH, DEATH, RECORD, CLICK, BUY, LEVEL, BREED, BUMP, LASER, HOP, BOSS_ROAR, BOSS_HIT, BOSS_DEAD, WARN, BOX, REVEAL_C, REVEAL_R, REVEAL_E, REVEAL_L, THROW, SLIP }
 
     var enabled = true
 
@@ -177,6 +177,7 @@ class Sfx(private val ctx: Context) {
                 0.6f to arp(intArrayOf(7, 12, 16, 19, 24, 28, 31, 36), 0.11f, TRI, 0.45f, 0.5f),
                 0.6f to arp(intArrayOf(0, 7, 12, 19), 0.11f, SQUARE, 0.15f, 0.5f, 0.5f))
             S.THROW -> tone(200f, 900f, 0.25f, TRI, 0.3f, decay = 1.2f)
+            S.SLIP -> mix(0.25f, 0f to tone(700f, 700f, 0.16f, NOISE, 0.28f, decay = 1.6f), 0.01f to tone(900f, 220f, 0.18f, SQUARE, 0.18f, 0.5f))
             S.WARN -> mix(0.4f,
                 0f to tone(880f, 880f, 0.1f, SQUARE, 0.22f, 0.5f),
                 0.16f to tone(880f, 880f, 0.1f, SQUARE, 0.22f, 0.5f))

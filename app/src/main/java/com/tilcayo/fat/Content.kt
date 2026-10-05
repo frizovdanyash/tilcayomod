@@ -157,19 +157,68 @@ object Farms {
             0, "🌳", listOf("🌼", "🌷", "🍄", "🌱", "🌸"),
         ),
         FarmTheme(
-            "Дюны", "🏜️", 3000L, 1.6f,
+            "Дюны", "🏜️", 8000L, 1.6f,
             c(0xFFF4A259), c(0xFFFFE9C7), c(0xFFE8C07A), c(0xFFD9A860), c(0xFFEACB87), c(0xFFC98B4A), c(0xFF9C6431),
             1, "🌵", listOf("🌵", "🌾", "🐚", "🦎", "🌻"),
         ),
         FarmTheme(
-            "Снега", "❄️", 15000L, 2.4f,
+            "Снега", "❄️", 40000L, 2.4f,
             c(0xFF8FB8E8), c(0xFFEAF4FF), c(0xFFF2F8FF), c(0xFFDCEBFA), c(0xFFE6F0F8), c(0xFFE8EEF6), c(0xFF9FB6CC),
             2, "🌲", listOf("❄️", "⛄", "🎄", "🌨️", "⭐"), snow = true,
         ),
         FarmTheme(
-            "Луна", "🌙", 60000L, 4f,
+            "Луна", "🌙", 160000L, 4f,
             c(0xFF0B0B2A), c(0xFF2A1B5A), c(0xFF6B6B8F), c(0xFF55557A), c(0xFF8A8AA8), c(0xFFB0B8C8), c(0xFF6E7890),
             3, "🛸", listOf("⭐", "🌑", "✨", "🔭", "🚀"), stars = true,
         ),
+    )
+}
+
+/** Модификатор забега: меняет правила и множитель монет. */
+class Mod(val id: Int, val emoji: String, val name: String, val desc: String, val bonus: Float, val excludes: Int = -1)
+
+object Mods {
+    const val SPARSE = 0
+    const val DENSE = 1
+    const val VIRUS = 2
+    const val LAVA = 3
+    const val NIGHT = 4
+    const val MIRROR = 5
+
+    val all = listOf(
+        Mod(SPARSE, "🍃", "Тихая гавань", "Намного меньше препятствий", -0.5f, excludes = DENSE),
+        Mod(DENSE, "🌲", "Дремучий лес", "Препятствий больше, передышек почти нет", 0.25f, excludes = SPARSE),
+        Mod(VIRUS, "🦠", "Вирусы", "На экране всплывают окна с вирусами. Закрывай их!", 0.2f),
+        Mod(LAVA, "🌋", "Лавовый шторм", "Лава поднимается в 1,6 раза быстрее", 0.3f),
+        Mod(NIGHT, "🌑", "Тёмная ночь", "Видно только вокруг тилкайо", 0.25f),
+        Mod(MIRROR, "🔄", "Зеркало", "Свайпы работают наоборот", 0.2f),
+    )
+
+    fun has(mask: Int, id: Int) = (mask shr id) and 1 == 1
+
+    /** Итоговый множитель монет от набора модификаторов. */
+    fun multiplier(mask: Int): Float {
+        var m = 1f
+        for (md in all) if (has(mask, md.id)) m *= 1f + md.bonus
+        return m
+    }
+
+    /** Включает/выключает модификатор, снимая несовместимый. */
+    fun toggle(mask: Int, id: Int): Int {
+        var r = mask xor (1 shl id)
+        val ex = all[id].excludes
+        if (has(r, id) && ex >= 0) r = r and (1 shl ex).inv()
+        return r
+    }
+
+    fun count(mask: Int) = all.count { has(mask, it.id) }
+}
+
+/** Босс для режима «Босс-раш». */
+class BossDef(val name: String, val hp: Int, val reward: Long, val par: Float)
+
+object Bosses {
+    val all = listOf(
+        BossDef("Толстый Котозаяц", 6, 500L, 60f),
     )
 }

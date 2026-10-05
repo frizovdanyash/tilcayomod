@@ -77,4 +77,76 @@ class ModSimTest {
         s.boss = Boss(4).apply { state = Boss.CHARGE_WARN; x = s.px; y = -200f }
         s.step(0.001f); assertFalse(s.dead); assertEquals(4, s.boss!!.hp)
     }
+    @Test fun flyModeThrust() {
+        val s = sim(); s.flyMode = true
+        s.jump()
+        s.holdUp = true
+        val start = s.py
+        repeat(60) { s.step(1f / 60f) }
+        assertTrue("поднимается вверх", s.py < start - 100f)
+        s.holdUp = false
+        val top = s.py
+        repeat(150) { s.step(1f / 60f) }
+        assertTrue("без пальца опускается", s.py > top)
+    }
+    @Test fun frozenLaserIsHarmless() {
+        val s = sim(); s.freezeHazards = true
+        s.lasers.add(Laser(s.py, 2f, 1f, 0f))
+        repeat(30) { s.step(1f / 60f) }
+        assertFalse(s.dead)
+        val moving = sim(); moving.lasers.add(Laser(moving.py, 2f, 1f, 0f))
+        moving.step(1f / 60f)
+        assertTrue(moving.dead)
+    }
+    @Test fun magnetPullsCoinsFromDistance() {
+        val s = sim()
+        s.coins.add(Coin(s.px, s.py - 120f))
+        s.step(1f / 60f)
+        assertEquals(0f, s.runCoins, 0f)
+        s.magnet = true
+        s.step(1f / 60f)
+        assertEquals(1f, s.runCoins, 0f)
+    }
+    @Test fun rewardMultiplierScalesCoins() {
+        val s = sim(); s.magnet = true; s.rewardMul = 5f
+        s.coins.add(Coin(s.px, s.py - 100f))
+        s.step(1f / 60f)
+        assertEquals(5f, s.runCoins, 0f)
+    }
+    @Test fun instaBossKillsInOneTouch() {
+        val s = sim(); s.instaBoss = true; s.godMode = true
+        s.arena = Arena(-600f, 0f, 5).apply { active = true }
+        s.boss = Boss(5).apply { state = Boss.HOVER; x = s.px; y = s.py }
+        s.step(1f / 120f)
+        assertFalse(s.dead)
+        assertEquals(Boss.DEAD, s.boss!!.state)
+    }
+    @Test fun forceKillBossRewardsPlayer() {
+        val s = sim()
+        s.arena = Arena(-600f, 0f, 5).apply { active = true }
+        s.boss = Boss(5).apply { state = Boss.HOVER; x = 180f; y = -200f }
+        assertTrue(s.forceKillBoss())
+        assertEquals(Boss.DEAD, s.boss!!.state)
+        assertTrue(s.runCoins >= 150f)
+        assertFalse(s.forceKillBoss())
+    }
+    @Test fun infiniteShieldBreaksSaws() {
+        val s = sim(); s.infiniteShield = true
+        s.saws.add(Saw(s.px, s.py, s.px, s.py, 0f, 0f))
+        s.step(1f / 60f)
+        assertFalse(s.dead)
+        assertTrue(s.shield > 0f)
+        assertTrue(s.saws[0].dead)
+        assertEquals(3f, s.runCoins, 0f)
+    }
+    @Test fun teleportToHeightSetsAbsolutePosition() {
+        val s = sim(); s.bossesBeaten = 1
+        s.arena = Arena(-5600f, -5000f, 5).apply { active = true }
+        s.boss = Boss(5)
+        s.teleportToHeight(500f)
+        assertEquals(-5000f, s.py, 0f)
+        assertNull(s.boss); assertNull(s.arena)
+        assertEquals(1, s.bossesBeaten)
+        assertTrue(s.onWall)
+    }
 }

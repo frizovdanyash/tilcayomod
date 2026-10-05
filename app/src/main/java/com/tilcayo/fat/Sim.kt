@@ -22,7 +22,10 @@ object Phys {
     const val JUMP_VX = 320f
     const val AIR_VY = 470f
     const val MAX_AIR = 2
-    const val SLIDE = 45f
+    /** Сколько тилкайо намертво держится на стене, прежде чем начать срываться. */
+    const val GRIP_TIME = 1.0f
+    const val FALL_ACC = 1400f
+    const val FALL_MAX = 650f
     const val TAU = (2.0 * PI).toFloat()
 
     fun radius(level: Int) = 15f + level * 1.7f
@@ -82,6 +85,17 @@ class Hair(var x: Float, var y: Float, var vx: Float, var vy: Float, val kind: I
     fun copy() = Hair(x, y, vx, vy, kind, life)
 }
 
+/** Патрон, который можно подобрать в бою с боссом. */
+class AmmoItem(val x: Float, val y: Float) {
+    var life = 12f
+    fun copy() = AmmoItem(x, y).also { it.life = life }
+}
+
+/** Выпущенная игроком пуля, самонаводящаяся на босса. */
+class Bullet(var x: Float, var y: Float, var vx: Float, var vy: Float, var life: Float) {
+    fun copy() = Bullet(x, y, vx, vy, life)
+}
+
 /** Толстый Котозаяц. Все состояния — простые поля, поэтому его легко копировать для ботов. */
 class Boss(val hpMax: Int) {
     var x = Phys.W / 2
@@ -103,6 +117,8 @@ class Boss(val hpMax: Int) {
     var dodgeT = 0f
     var dodgeCd = 1.2f
     var dodgeDir = 1
+    /** Направление безопасного прохода в кольце пуха. */
+    var gapAng = 0f
 
     fun rand(): Float {
         seed = seed * 1103515245 + 12345
@@ -113,13 +129,19 @@ class Boss(val hpMax: Int) {
         val b = Boss(hpMax)
         b.x = x; b.y = y; b.hp = hp; b.state = state; b.t = t; b.hover = hover; b.stun = stun; b.flash = flash
         b.attack = attack; b.dir = dir; b.fired = fired; b.seed = seed; b.tx = tx; b.face = face
-        b.off = off; b.dodgeT = dodgeT; b.dodgeCd = dodgeCd; b.dodgeDir = dodgeDir
+        b.gapAng = gapAng; b.off = off; b.dodgeT = dodgeT; b.dodgeCd = dodgeCd; b.dodgeDir = dodgeDir
         cols.copyInto(b.cols)
         return b
     }
 
     companion object {
         const val R = 50f
+
+        /** Босс злой во время атак: тогда касание смертельно, а пули отскакивают. */
+        fun angry(state: Int) = state in VOLLEY_TELE..RAIN_FALL
+
+        /** Половина угла безопасного прохода (рад). С каждым ударом проход чуть уже. */
+        fun gapHalf(phase: Int) = max(0.45f, 0.66f - 0.035f * phase)
         const val ENTER = 0
         const val HOVER = 1
         const val VOLLEY_TELE = 2
@@ -154,6 +176,10 @@ class Ev(val type: Int, val x: Float = 0f, val y: Float = 0f, val ref: Any? = nu
         const val BOSS_FIRE = 13
         const val BOSS_HIT = 14
         const val BOSS_DEAD = 15
+        const val AMMO = 16
+        const val SHOOT = 17
+        const val BULLET_BLOCK = 18
+        const val SLIP = 19
     }
 }
 
@@ -161,12 +187,14 @@ class Snap(
     val px: Float, val py: Float, val pvx: Float, val pvy: Float,
     val side: Int, val face: Int, val onWall: Boolean, val clingIdx: Int,
     val jumpsLeft: Int, val jumpBuf: Float, val boostT: Float, val time: Float, val bumpCd: Float,
+    val gripT: Float = 0f, val wallVy: Float = 0f,
 )
 
 /** Снимок, который включает босса и снаряды (для тестов-ботов). */
 class FullState(
     val snap: Snap, val boss: Boss?, val hairs: List<Hair>, val camY: Float, val lavaY: Float,
     val minPy: Float, val runCoins: Float, val shield: Float, val arenaActive: Boolean, val dead: Boolean,
+    val bullets: List<Bullet> = emptyList(), val ammoItems: List<AmmoItem> = emptyList(), val ammo: Int = 0, val ammoTimer: Float = 0f,
 )
 
 // ---------------------------------------------------------------------------
@@ -178,10 +206,28 @@ class Sim {
     var lavaOn = true
     var camOn = true
     var collect = true
-    // Выключены по умолчанию: исходные решатели работают без модификаций.
+
+    // ---------- MOD ----------
+    /** Полная неуязвимость, включая лаву, падение и босса. */
     var godMode = false
+    /** Проход сквозь препятствия и босса; боковые стены остаются. */
     var noCollision = false
+    /** Прыжки в воздухе не расходуются. */
     var infiniteJumps = false
+    /** Реактивный полёт: держи палец — тилкайо поднимается. */
+    var flyMode = false
+    /** Палец сейчас на экране. */
+    var holdUp = false
+    /** Постоянный щит. */
+    var infiniteShield = false
+    /** Опасности замирают: пилы и орбиты стоят, лазеры молчат. */
+    var freezeHazards = false
+    /** Монеты слетаются к игроку. */
+    var magnet = false
+    /** Босс умирает с одного удара. */
+    var instaBoss = false
+    /** Множитель награды за забег. */
+    var rewardMul = 1f
     /** Запас на размер хитбокса — решатель перестраховывается. */
     var hrExtra = 0f
 
@@ -202,6 +248,9 @@ class Sim {
     var inCannon: Cannon? = null
     var cannonT = 0f
     var bumpCd = 0f
+    /** Сколько секунд тилкайо уже на стене и как быстро он срывается вниз. */
+    var gripT = 0f
+    var wallVy = 0f
     var level = 1
     var r = 16f
     var hr = 9f
@@ -222,7 +271,13 @@ class Sim {
     var arena: Arena? = null
     var boss: Boss? = null
     val hairs = ArrayList<Hair>()
+    val bullets = ArrayList<Bullet>()
+    val ammoItems = ArrayList<AmmoItem>()
+    var ammo = 0
+    var ammoTimer = 6f
     var bossesBeaten = 0
+    /** Множитель скорости лавы (модификатор). */
+    var lavaMul = 1f
 
     // мир
     val coins = ArrayList<Coin>()
@@ -263,6 +318,8 @@ class Sim {
         shield = 0f
         boostT = 0f
         bumpCd = 0f
+        gripT = 0f
+        wallVy = 0f
         time = 0f
         camY = py - viewH * 0.62f
         lavaY = py + 440f
@@ -276,24 +333,41 @@ class Sim {
         arena = null
         boss = null
         hairs.clear()
+        bullets.clear()
+        ammoItems.clear()
+        ammo = 0
+        ammoTimer = 6f
         bossesBeaten = 0
     }
 
-    /** Мгновенный перенос: не симулируем пропущенные километры, не выдаём награду за босса. */
+    /** MOD: перенос вверх на N метров. */
     fun teleportForward(meters: Float) {
         require(ModRules.validMeters(meters))
-        py = ModRules.teleportedY(py, meters)
+        teleportTo(py - meters * 10f)
+    }
+
+    /** MOD: перенос на абсолютную высоту в метрах. */
+    fun teleportToHeight(meters: Float) {
+        require(ModRules.validMeters(meters))
+        teleportTo(-meters * 10f)
+    }
+
+    /** Общая часть переноса: не симулируем пропущенные метры и не выдаём награду за босса. */
+    private fun teleportTo(targetY: Float) {
+        py = targetY
         px = stickX(-1); side = -1; face = 1
         pvx = 0f; pvy = 0f
         onWall = true; cling = null; inCannon = null
         cannonT = 0f; boostT = 0f; jumpBuf = 0f; bumpCd = 0f
+        gripT = 0f; wallVy = 0f
         jumpsLeft = Phys.MAX_AIR
         shield = max(shield, 2f)
         minPy = min(minPy, py)
         camY = py - viewH * 0.62f
         lavaY = py + 440f
         clearWorld()
-        arena = null; boss = null; hairs.clear(); events.clear()
+        arena = null; boss = null; hairs.clear(); bullets.clear(); ammoItems.clear(); ammo = 0
+        events.clear()
         genY = camY + viewH + 200f
     }
 
@@ -303,10 +377,11 @@ class Sim {
 
     // ---------- снимок для решателя ----------
 
-    fun save() = Snap(px, py, pvx, pvy, side, face, onWall, if (cling == null) -1 else pillars.indexOf(cling!!), jumpsLeft, jumpBuf, boostT, time, bumpCd)
+    fun save() = Snap(px, py, pvx, pvy, side, face, onWall, if (cling == null) -1 else pillars.indexOf(cling!!), jumpsLeft, jumpBuf, boostT, time, bumpCd, gripT, wallVy)
 
     fun saveFull() = FullState(
         save(), boss?.copy(), hairs.map { it.copy() }, camY, lavaY, minPy, runCoins, shield, arena?.active == true, dead,
+        bullets.map { it.copy() }, ammoItems.map { it.copy() }, ammo, ammoTimer,
     )
 
     fun loadFull(f: FullState) {
@@ -317,6 +392,10 @@ class Sim {
         camY = f.camY; lavaY = f.lavaY; minPy = f.minPy; runCoins = f.runCoins; shield = f.shield
         arena?.active = f.arenaActive
         dead = f.dead
+        bullets.clear(); for (b in f.bullets) bullets.add(b.copy())
+        ammoItems.clear(); for (a in f.ammoItems) ammoItems.add(a.copy())
+        ammo = f.ammo
+        ammoTimer = f.ammoTimer
     }
 
     fun load(s: Snap) {
@@ -324,6 +403,7 @@ class Sim {
         side = s.side; face = s.face; onWall = s.onWall
         cling = if (s.clingIdx < 0) null else pillars[s.clingIdx]
         jumpsLeft = s.jumpsLeft; jumpBuf = s.jumpBuf; boostT = s.boostT; time = s.time; bumpCd = s.bumpCd
+        gripT = s.gripT; wallVy = s.wallVy
         shield = 0f; inCannon = null; squash = 0f; dead = false
     }
 
@@ -357,6 +437,8 @@ class Sim {
         onWall = true
         pvx = 0f
         pvy = 0f
+        gripT = 0f
+        wallVy = 0f
         squash = 1f
         jumpsLeft = Phys.MAX_AIR
         events.add(Ev(Ev.LAND, px, py))
@@ -389,6 +471,11 @@ class Sim {
         squash += (0f - squash) * min(1f, dt * 9f)
         jumpBuf = max(0f, jumpBuf - dt)
         shield = max(0f, shield - dt)
+        if (infiniteShield) shield = max(shield, 3f)
+        if (flyMode && holdUp && inCannon == null) {
+            if (onWall) jump()
+            else if (boostT <= 0f) pvy = max(pvy - 1500f * dt, -430f)
+        }
         bumpCd = max(0f, bumpCd - dt)
 
         val cn = inCannon
@@ -399,16 +486,27 @@ class Sim {
             py = cn.y
             if (cannonT > 2.4f) fireCannon()
         } else if (onWall) {
-            py += Phys.SLIDE * dt
+            // секунду висит намертво, потом срывается и быстро падает, пока не прыгнешь
+            val before = gripT
+            gripT += dt
+            if (gripT > Phys.GRIP_TIME) {
+                if (before <= Phys.GRIP_TIME) events.add(Ev(Ev.SLIP, px, py))
+                wallVy = min(wallVy + Phys.FALL_ACC * dt, Phys.FALL_MAX)
+                py += wallVy * dt
+            }
             val pl = cling
             if (pl != null && py - hr * 0.3f > pl.y1) {
                 onWall = false
                 cling = null
                 pvx = 0f
-                pvy = 60f
+                pvy = wallVy
             }
         } else {
-            val g = if (boostT > 0f) Phys.GRAV * 0.12f else Phys.GRAV
+            val g = when {
+                boostT > 0f -> Phys.GRAV * 0.12f
+                flyMode -> Phys.GRAV * 0.22f
+                else -> Phys.GRAV
+            }
             boostT = max(0f, boostT - dt)
             pvy = min(pvy + g * dt, 950f)
             px += pvx * dt
@@ -441,7 +539,7 @@ class Sim {
                 lavaY = a!!.bottom + 50f
             } else {
                 val height = -minPy
-                lavaY -= (30f + min(70f, height / 20f)) * dt
+                lavaY -= (30f + min(70f, height / 20f)) * lavaMul * dt
                 lavaY = min(lavaY, py + 500f)
             }
             if (!godMode && !noCollision && shield <= 0f && py + hr > lavaY) return die("Тилкайо сгорел в лаве 🔥")
@@ -502,14 +600,26 @@ class Sim {
         return dx * dx + dy * dy < rad * rad
     }
 
+    /** MOD: мгновенно добить босса — награда и бокс начисляются как за победу. */
+    fun forceKillBoss(): Boolean {
+        val b = boss ?: return false
+        val a = arena ?: return false
+        if (b.state == Boss.DEAD || b.state == Boss.ENTER) return false
+        b.hp = 1
+        hitBoss(b, a, 2)
+        return true
+    }
+
     private fun die(reason: String) {
         if (godMode || noCollision) {
+            // не даём умереть: падение за экран возвращает к стене
             if (py - hr > camY + viewH + 20f) {
                 py = camY + viewH * 0.62f
                 px = stickX(-1); side = -1; face = 1
                 pvx = 0f; pvy = 0f
                 onWall = true; cling = null; inCannon = null
                 jumpsLeft = Phys.MAX_AIR; jumpBuf = 0f; boostT = 0f
+                gripT = 0f; wallVy = 0f
                 lavaY = py + 440f
             }
             return
@@ -519,7 +629,10 @@ class Sim {
         events.add(Ev(Ev.DIE, px, py))
     }
 
-    private fun checkHazards(prevTime: Float, t: Float) {
+    private fun checkHazards(prevTimeIn: Float, tIn: Float) {
+        // «Заморозка» не двигает пилы, орбиты и выключает лазеры
+        val t = if (freezeHazards) 0f else tIn
+        val prevTime = if (freezeHazards) 0f else prevTimeIn
         val hh = hr + hrExtra
         val invuln = godMode || noCollision || shield > 0f || inCannon != null
 
@@ -542,7 +655,7 @@ class Sim {
                 if (dx * dx + dy * dy < rr * rr) {
                     if (shield > 0f) {
                         s.dead = true
-                        runCoins += coinMul * 3
+                        runCoins += coinMul * 3f * rewardMul
                         events.add(Ev(Ev.SMASH, tmp[0], tmp[1]))
                     } else return die("Распилило пополам ⚙️")
                 }
@@ -559,7 +672,7 @@ class Sim {
                     if (dx * dx + dy * dy < rr * rr) {
                         if (shield > 0f) {
                             o.alive[i] = false
-                            runCoins += coinMul * 3
+                            runCoins += coinMul * 3f * rewardMul
                             events.add(Ev(Ev.SMASH, sx, sy))
                         } else return die("Закрутило пилами 🌀")
                     }
@@ -567,7 +680,7 @@ class Sim {
             }
         }
         for (l in lasers) {
-            val on = l.isOn(t)
+            val on = !freezeHazards && l.isOn(t)
             if (on && !l.isOn(prevTime)) events.add(Ev(Ev.LASER_ON, 0f, l.y))
             if (on && !invuln && abs(py - l.y) < hh + 4f) return die("Поджарило лазером ⚡")
         }
@@ -630,7 +743,13 @@ class Sim {
         b.t = 0f
         b.fired = 0
         b.state = when (next) {
-            0 -> Boss.VOLLEY_TELE
+            0 -> {
+                // безопасный проход — рядом с игроком, но не точно на нём: надо чуть сместиться
+                val toP = kotlin.math.atan2(py - b.y, px - b.x)
+                val off = (0.4f + 0.5f * b.rand()) * (if (b.rand() < 0.5f) -1f else 1f)
+                b.gapAng = toP + off
+                Boss.VOLLEY_TELE
+            }
             1 -> { b.dir = if (b.rand() < 0.5f) 1 else -1; Boss.CHARGE_MOVE }
             else -> {
                 // три колонны дождя на расстоянии друг от друга
@@ -667,8 +786,11 @@ class Sim {
                 } else {
                     b.off -= b.off * min(1f, dt * 1.2f)
                 }
-                b.x = (mid + sin(b.hover * 0.9f) * range * 0.8f + b.off).coerceIn(mid - range, mid + range)
-                b.y = hoverY + sin(b.hover * 1.7f) * 26f
+                // плавно подплывает к траектории парения (после оглушения не дёргается)
+                val hx = (mid + sin(b.hover * 0.9f) * range * 0.8f + b.off).coerceIn(mid - range, mid + range)
+                val hy = hoverY + sin(b.hover * 1.7f) * 26f
+                b.x += (hx - b.x) * min(1f, dt * 14f)
+                b.y += (hy - b.y) * min(1f, dt * 10f)
                 b.face = if (cos(b.hover * 0.9f) >= 0f) 1 else -1
                 // видит, что сверху пикируют, — отпрыгивает в сторону
                 if (b.dodgeCd <= 0f && b.dodgeT <= 0f && py < b.y - 30f && py > b.y - 240f &&
@@ -679,22 +801,32 @@ class Sim {
                     b.dodgeT = 0.3f
                     b.dodgeCd = max(0.9f, 1.7f - 0.15f * phase)
                 }
-                if (b.t >= max(0.3f, 0.95f - 0.1f * phase)) chooseAttack(b, phase)
+                if (b.t >= max(0.6f, 1.4f - 0.12f * phase)) chooseAttack(b, phase)
             }
             Boss.VOLLEY_TELE -> {
                 b.y = hoverY + sin(b.t * 30f) * 2f
-                if (b.t >= max(0.45f, 0.85f - 0.07f * phase)) { b.state = Boss.VOLLEY_FIRE; b.t = 0f; b.fired = 0 }
+                if (b.t >= max(0.75f, 1.1f - 0.06f * phase)) { b.state = Boss.VOLLEY_FIRE; b.t = 0f; b.fired = 0 }
             }
             Boss.VOLLEY_FIRE -> {
-                val n = min(8, 4 + phase)
-                if (b.t >= 0.14f * b.fired && b.fired < n) {
+                // кольцо пуха с проходом; позже — второе кольцо с тем же проходом
+                val waves = if (phase >= 2) 2 else 1
+                if (b.fired < waves && b.t >= 0.6f * b.fired) {
                     b.fired++
-                    val ang = kotlin.math.atan2(py - b.y, px - b.x) + (b.rand() - 0.5f) * 0.9f
-                    val sp = 235f + 14f * phase
-                    hairs.add(Hair(b.x, b.y, cos(ang) * sp, sin(ang) * sp, 0, 6f))
+                    val n = 18
+                    val step = Phys.TAU / n
+                    val half = Boss.gapHalf(phase)
+                    val sp = 150f + 8f * phase
+                    for (i in 0 until n) {
+                        val ang = b.gapAng + step / 2f + i * step
+                        var diff = (ang - b.gapAng) % Phys.TAU
+                        if (diff > Math.PI) diff -= Phys.TAU
+                        if (diff < -Math.PI) diff += Phys.TAU
+                        if (abs(diff) < half) continue
+                        hairs.add(Hair(b.x + cos(ang) * 28f, b.y + sin(ang) * 28f, cos(ang) * sp, sin(ang) * sp, 0, 6f))
+                    }
                     events.add(Ev(Ev.BOSS_FIRE, b.x, b.y))
                 }
-                if (b.fired >= n && b.t >= 0.14f * n + 0.35f) { b.state = Boss.HOVER; b.t = 0f }
+                if (b.fired >= waves && b.t >= 0.6f * (waves - 1) + 0.7f) { b.state = Boss.HOVER; b.t = 0f }
             }
             Boss.CHARGE_MOVE -> {
                 val tx = mid - b.dir * range
@@ -738,6 +870,8 @@ class Sim {
                 if (b.t >= 2.2f) {
                     boss = null
                     hairs.clear()
+                    bullets.clear()
+                    ammoItems.clear()
                     a.active = false
                     a.done = true
                     arena = null
@@ -759,7 +893,7 @@ class Sim {
 
         // столкновения с игроком
         val hh = hr + hrExtra
-        val invuln = godMode || noCollision || shield > 0f || inCannon != null
+        val invuln = shield > 0f || inCannon != null
         if (!invuln) {
             for (h in hairs) {
                 val dx = h.x - px
@@ -774,30 +908,130 @@ class Sim {
             val rr = hr + Boss.R * 0.92f
             if (dx * dx + dy * dy < rr * rr) {
                 if (b.state == Boss.STUN) return
-                if (pvy > 40f && py < b.y - Boss.R * 0.2f) {
-                    stomp(b, a)
-                } else if (!godMode && shield <= 0f) {
+                val fromTop = pvy > 40f && py < b.y - Boss.R * 0.2f
+                if (fromTop) {
+                    hitBoss(b, a, 0)
+                } else if (!Boss.angry(b.state)) {
+                    hitBoss(b, a, 1)
+                } else if (!godMode && !noCollision && shield <= 0f) {
                     die("Толстый Котозаяц тебя расплющил 🐰")
                 }
             }
         }
+
+        // патроны: появляются редко, пока босс дерётся
+        if (b.state != Boss.ENTER) {
+            ammoTimer -= dt
+            if (ammoTimer <= 0f) {
+                ammoTimer = 8f + b.rand() * 5f
+                if (ammoItems.isEmpty() && ammo < 3) {
+                    val x = Phys.WALL + 36f + b.rand() * (Phys.W - 2 * Phys.WALL - 72f)
+                    val y = a.top + 260f + b.rand() * (a.bottom - a.top - 330f)
+                    ammoItems.add(AmmoItem(x, y))
+                }
+            }
+        }
+        val ai = ammoItems.iterator()
+        while (ai.hasNext()) {
+            val it2 = ai.next()
+            it2.life -= dt
+            val ddx = it2.x - px
+            val ddy = it2.y - py
+            val rr2 = hr + 20f
+            if (it2.life <= 0f) ai.remove()
+            else if (ddx * ddx + ddy * ddy < rr2 * rr2) {
+                ai.remove()
+                ammo = min(3, ammo + 1)
+                events.add(Ev(Ev.AMMO, it2.x, it2.y))
+            }
+        }
+
+        // пули самонаводятся на босса и ранят его, только если он не злой
+        val bi = bullets.iterator()
+        while (bi.hasNext()) {
+            val bu = bi.next()
+            bu.life -= dt
+            val tx = b.x - bu.x
+            val ty = b.y - bu.y
+            val d = max(1f, kotlin.math.sqrt(tx * tx + ty * ty))
+            val sp = 560f
+            val cur = kotlin.math.atan2(bu.vy, bu.vx)
+            val want = kotlin.math.atan2(ty, tx)
+            var diff = want - cur
+            while (diff > Math.PI) diff -= Phys.TAU
+            while (diff < -Math.PI) diff += Phys.TAU
+            val turn = (7f * dt).coerceAtMost(abs(diff)) * (if (diff >= 0f) 1f else -1f)
+            val na = cur + turn
+            bu.vx = cos(na) * sp
+            bu.vy = sin(na) * sp
+            bu.x += bu.vx * dt
+            bu.y += bu.vy * dt
+            if (bu.life <= 0f) { bi.remove(); continue }
+            if (d < Boss.R * 0.9f && b.state != Boss.ENTER && b.state != Boss.DEAD) {
+                bi.remove()
+                if (!Boss.angry(b.state) && b.state != Boss.STUN) hitBoss(b, a, 2)
+                else events.add(Ev(Ev.BULLET_BLOCK, bu.x, bu.y))
+            }
+        }
     }
 
-    private fun stomp(b: Boss, a: Arena) {
-        b.hp--
+    /** Выстрел по боссу. Возвращает true, если патрон потрачен. */
+    fun shoot(): Boolean {
+        val b = boss ?: return false
+        if (ammo <= 0 || dead || b.state == Boss.DEAD) return false
+        ammo--
+        val ang = kotlin.math.atan2(b.y - py, b.x - px)
+        bullets.add(Bullet(px, py, cos(ang) * 560f, sin(ang) * 560f, 2.6f))
+        events.add(Ev(Ev.SHOOT, px, py))
+        return true
+    }
+
+    /** Режим «Босс-раш»: игрок сразу в арене, остального уровня нет. */
+    fun startRush(hp: Int) {
+        val ah = min(620f, viewH - 150f)
+        val a = Arena(-80f - ah, -80f, hp)
+        arena = a
+        side = -1
+        face = 1
+        onWall = true
+        px = stickX(-1)
+        py = a.bottom - 120f
+        minPy = py
+        camY = a.bottom + 55f - viewH
+        lavaY = a.bottom + 50f
+        genY = a.top - 100f
+    }
+
+    /** Урон боссу. kind: 0 — прыжок сверху, 1 — касание, пока он не злой, 2 — пуля. */
+    private fun hitBoss(b: Boss, a: Arena, kind: Int) {
+        if (instaBoss) b.hp = 0 else b.hp--
         b.flash = 0.5f
-        pvy = -560f
-        pvx = if (px < b.x) -120f else 120f
-        onWall = false
-        cling = null
-        jumpsLeft = Phys.MAX_AIR
-        shield = 0.8f
+        when (kind) {
+            0 -> {
+                pvy = -560f
+                pvx = if (px < b.x) -120f else 120f
+            }
+            1 -> {
+                // отбрасывает от босса, чтобы не прилипнуть
+                val dx = px - b.x
+                val dy = py - b.y
+                val d = max(1f, kotlin.math.sqrt(dx * dx + dy * dy))
+                pvx = dx / d * 380f
+                pvy = dy / d * 380f - 220f
+            }
+        }
+        if (kind != 2) {
+            onWall = false
+            cling = null
+            jumpsLeft = Phys.MAX_AIR
+            shield = 0.8f
+        }
         hairs.clear()
-        events.add(Ev(Ev.BOSS_HIT, b.x, b.y))
+        events.add(Ev(Ev.BOSS_HIT, b.x, b.y, kind))
         if (b.hp <= 0) {
             b.state = Boss.DEAD
             b.t = 0f
-            runCoins += coinMul * 150f
+            runCoins += coinMul * 150f * rewardMul
             for (i in 0 until 24) {
                 val ang = i * Phys.TAU / 24f
                 coins.add(Coin(b.x + cos(ang) * 70f, b.y + sin(ang) * 55f))
@@ -814,10 +1048,10 @@ class Sim {
             if (co.got) continue
             val dx = co.x - px
             val dy = co.y - py
-            val rr = hr + 22f
+            val rr = if (magnet) 135f else hr + 22f
             if (dx * dx + dy * dy < rr * rr) {
                 co.got = true
-                runCoins += coinMul
+                runCoins += coinMul * rewardMul
                 events.add(Ev(Ev.COIN, co.x, co.y))
             }
         }

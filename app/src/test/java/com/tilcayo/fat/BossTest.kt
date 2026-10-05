@@ -78,6 +78,84 @@ class BossTest {
         return Pair(sim.bossesBeaten > 0, sim.time)
     }
 
+    private fun arenaSim(): Sim {
+        val sim = Sim()
+        sim.reset(5, 1f, 800f)
+        sim.startRush(5)
+        // дождаться, пока босс въедет и перейдёт в спокойное парение
+        var guard = 0
+        while (guard++ < 2000 && sim.boss?.state != Boss.HOVER) { sim.shield = 9f; sim.py = sim.arena!!.bottom - 100f; sim.step(1f / 60f) }
+        sim.shield = 0f
+        return sim
+    }
+
+    @Test
+    fun calmBossIsHurtByAnyTouch() {
+        val sim = arenaSim()
+        val b = sim.boss!!
+        assert(b.state == Boss.HOVER)
+        // подходим сбоку и касаемся
+        sim.onWall = false
+        sim.px = b.x - (Boss.R * 0.92f + sim.hr - 4f); sim.py = b.y; sim.pvx = 0f; sim.pvy = 0f
+        val hp0 = b.hp
+        sim.step(1f / 60f)
+        println("TOUCH hp $hp0 -> ${sim.boss?.hp} dead=${sim.dead}")
+        assert(!sim.dead && sim.boss!!.hp == hp0 - 1)
+    }
+
+    @Test
+    fun angryBossKillsOnTouch() {
+        val sim = arenaSim()
+        val b = sim.boss!!
+        b.state = Boss.VOLLEY_TELE
+        b.t = 0f
+        sim.onWall = false
+        sim.px = b.x - (Boss.R * 0.92f + sim.hr - 4f); sim.py = b.y; sim.pvx = 0f; sim.pvy = 0f
+        sim.step(1f / 60f)
+        println("ANGRY dead=${sim.dead}")
+        assert(sim.dead)
+    }
+
+    @Test
+    fun bulletsHurtOnlyCalmBoss() {
+        for (angry in booleanArrayOf(false, true)) {
+            val sim = arenaSim()
+            val b = sim.boss!!
+            sim.ammo = 1
+            sim.py = sim.arena!!.bottom - 100f
+            sim.onWall = true
+            assert(sim.shoot())
+            if (angry) { b.state = Boss.RAIN_TELE; b.t = 0f }
+            val hp0 = b.hp
+            var n = 0
+            while (n++ < 240 && sim.bullets.isNotEmpty()) {
+                sim.shield = 9f
+                sim.gripT = 0f; sim.wallVy = 0f // держим игрока на стене, чтобы он не срывался
+                if (angry) { b.t = 0f }
+                sim.step(1f / 60f)
+            }
+            println("BULLET angry=$angry hp $hp0 -> ${sim.boss?.hp}")
+            if (angry) assert(sim.boss!!.hp == hp0) else assert(sim.boss!!.hp == hp0 - 1)
+        }
+    }
+
+    @Test
+    fun ammoAppearsRarely() {
+        var spawned = 0
+        val sim = arenaSim()
+        var t = 0f
+        while (t < 120f && !sim.dead) {
+            sim.shield = 9f
+            sim.py = sim.arena!!.bottom - 100f; sim.px = 40f; sim.onWall = true
+            sim.step(1f / 60f)
+            for (e in sim.events) if (e.type == Ev.AMMO) spawned++
+            sim.events.clear()
+            if (sim.ammoItems.isNotEmpty()) { spawned = maxOf(spawned, 1) }
+            t += 1f / 60f
+        }
+        println("AMMO spawned/picked in 120s (rough)=$spawned")
+    }
+
     @Test
     fun dangerBaselines() {
         // пассивный игрок и случайный игрок: сколько живут рядом с боссом
@@ -141,5 +219,54 @@ class BossTest {
         }
         lines.forEach { println(it) }
         println("BOSS total wins=$wins/$total")
+    }
+}
+
+class RingFairnessTest {
+    /** Кольцо пуха оставляет проход: в нём можно стоять, в остальных направлениях — нет. */
+    @Test
+    fun ringHasASafeGapAndOnlyThere() {
+        var aliveInGap = 0
+        var deadElsewhere = 0
+        for (phase in intArrayOf(0, 2, 4)) {
+            for (seed in 1..6) {
+                for (inGap in booleanArrayOf(true, false)) {
+                    val sim = Sim()
+                    sim.reset(5, 1f, 800f)
+                    sim.startRush(5 + phase)
+                    var guard = 0
+                    while (guard++ < 3000 && sim.boss?.state != Boss.HOVER) { sim.shield = 9f; sim.py = sim.arena!!.bottom - 100f; sim.step(1f / 60f) }
+                    val b = sim.boss!!
+                    b.hp = b.hpMax - phase
+                    b.seed = seed * 7919
+                    sim.shield = 0f
+                    // принудительно запускаем кольцо
+                    b.attack = 1
+                    val m = Sim::class.java.getDeclaredMethod("chooseAttack", Boss::class.java, Int::class.javaPrimitiveType)
+                    m.isAccessible = true
+                    b.state = Boss.HOVER
+                    // chooseAttack выбирает случайно — крутим, пока не выпадет кольцо
+                    var tries = 0
+                    while (b.state != Boss.VOLLEY_TELE && tries++ < 50) { b.state = Boss.HOVER; m.invoke(sim, b, phase) }
+                    assert(b.state == Boss.VOLLEY_TELE)
+                    // стоим на расстоянии 150 от босса в направлении прохода (или напротив)
+                    val dirA = if (inGap) b.gapAng else b.gapAng + Math.PI.toFloat() / 2f + 0.3f
+                    var t = 0f
+                    while (t < 4f && !sim.dead) {
+                        sim.onWall = false
+                        sim.px = (b.x + kotlin.math.cos(dirA) * 150f)
+                        sim.py = (b.y + kotlin.math.sin(dirA) * 150f)
+                        sim.pvx = 0f; sim.pvy = 0f
+                        sim.step(1f / 60f)
+                        t += 1f / 60f
+                    }
+                    if (inGap && !sim.dead) aliveInGap++
+                    if (!inGap && sim.dead) deadElsewhere++
+                }
+            }
+        }
+        println("RING aliveInGap=$aliveInGap/18 deadElsewhere=$deadElsewhere/18")
+        assert(aliveInGap == 18)
+        assert(deadElsewhere >= 15)
     }
 }

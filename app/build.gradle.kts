@@ -11,8 +11,8 @@ android {
         applicationId = "com.tilcayo.fat.mod"
         minSdk = 24
         targetSdk = 35
-        versionCode = 6
-        versionName = "1.4-mod.2"
+        versionCode = 8
+        versionName = "1.6-mod.3"
     }
 
     buildTypes {

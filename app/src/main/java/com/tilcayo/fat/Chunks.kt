@@ -77,6 +77,10 @@ class Gen(private val sim: Sim, private val lib: List<ChunkTemplate>, private va
     var bossMinH = 3000f
     var bossCooldown = 5000f
     var bossChance = 0.08f
+
+    /** Модификаторы: «Тихая гавань» — препятствий вдвое меньше, «Дремучий лес» — почти без передышек. */
+    var sparse = false
+    var dense = false
     private var calmUntil = Float.POSITIVE_INFINITY
     private var lastWasBreather = false
     private val recent = ArrayDeque<Int>()
@@ -111,7 +115,8 @@ class Gen(private val sim: Sim, private val lib: List<ChunkTemplate>, private va
             !calm && sim.arena == null && h > bossMinH && h - lastBossH > bossCooldown && rnd.nextFloat() < bossChance -> bossChunk(y, h)
             calm -> if (rnd.nextFloat() < 0.2f) snackChunk(y) else coinChunk(y)
             h > 150f && rnd.nextFloat() < 0.07f -> snackChunk(y)
-            !lastWasBreather && rnd.nextFloat() < 0.2f -> { lastWasBreather = true; coinChunk(y) }
+            sparse && rnd.nextFloat() < 0.5f -> { lastWasBreather = true; coinChunk(y) }
+            !dense && !lastWasBreather && rnd.nextFloat() < 0.2f -> { lastWasBreather = true; coinChunk(y) }
             else -> libChunk(y, h)
         }
         sim.genY -= ch
@@ -121,10 +126,11 @@ class Gen(private val sim: Sim, private val lib: List<ChunkTemplate>, private va
         lastWasBreather = false
         val cands = ArrayList<Int>()
         val ws = ArrayList<Float>()
+        val effH = if (dense) h * 1.35f else h
         for ((i, t) in lib.withIndex()) {
-            if (t.minH > h || i in recent) continue
+            if (t.minH > effH || i in recent) continue
             // чем «старее» уровень сложности, тем реже он выпадает — игра постепенно усложняется
-            val age = (h - t.minH) / 3500f
+            val age = (effH - t.minH) / 3500f
             cands.add(i)
             ws.add(t.weight * kotlin.math.exp(-age))
         }
