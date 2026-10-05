@@ -13,6 +13,8 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
 import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Path
@@ -40,24 +42,7 @@ import kotlin.random.Random
  */
 class GameView(context: Context) : View(context) {
 
-    private enum class Scene { MENU, PLAY, DEAD, FARM }
-
-    // ---------- сущности забега ----------
-    private class Coin(val x: Float, val y: Float) { var got = false }
-    private class Snack(val x: Float, val y: Float, val emoji: String, val fat: Int) { var got = false }
-    private class Spike(val left: Boolean, val y0: Float, val y1: Float)
-    private class Saw(
-        var x: Float, var y: Float,
-        val x0: Float, val x1: Float, val y0: Float, val y1: Float,
-        var vx: Float, var vy: Float,
-    ) { var ang = 0f }
-    private class Orbit(val cx: Float, val cy: Float, val rad: Float, var a: Float, val spd: Float, val n: Int) {
-        val alive = BooleanArray(n) { true }
-    }
-    private class Laser(val y: Float, val period: Float, val onTime: Float, val phase: Float)
-    private class Pillar(val x0: Float, val y0: Float, val x1: Float, val y1: Float, val hot: Boolean)
-    private class Cannon(val x: Float, val y: Float) { var used = false; var ang = 0f }
-    private class Bumper(val x: Float, val y: Float) { var pop = 0f }
+    private enum class Scene { MENU, PLAY, DEAD, FARM, WARDROBE }
 
     // ---------- эффекты и UI ----------
     private class Particle(
@@ -80,7 +65,12 @@ class GameView(context: Context) : View(context) {
         var ph = 0f
         var hops = 0
         var spin = 0f
+        var spinV = 0f
         var hvx = 0f
+        var gvx = 0f
+        var gvy = 0f
+        var dizzy = 0f
+        var squash = 0f
 
         companion object {
             const val IDLE = 0
@@ -88,6 +78,8 @@ class GameView(context: Context) : View(context) {
             const val HOP = 2
             const val FLIP = 3
             const val EAT = 4
+            const val FLY = 5
+            const val DRAG = 6
         }
     }
 
@@ -95,12 +87,8 @@ class GameView(context: Context) : View(context) {
     private val W = 360f
     private val WALL = 34f
     private val SPIKE_LEN = 24f
-    private val GRAV = 1100f
-    private val JUMP_VY = 560f
-    private val JUMP_VX = 320f
-    private val AIR_VY = 470f
-    private val MAX_AIR = 2
-    private val SLIDE = 45f
+    private val MAX_AIR = Phys.MAX_AIR
+    private val SWIPE_U = 16f
 
     // фермерский луг (в UI-единицах)
     private val GX0 = 30f
@@ -113,6 +101,7 @@ class GameView(context: Context) : View(context) {
     private val sfx = Sfx(context)
     private val music = Music()
     private val sprite: Bitmap = BitmapFactory.decodeResource(resources, R.drawable.tilcayo)
+    private val bossSprite: Bitmap = BitmapFactory.decodeResource(resources, R.drawable.boss)
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
     private val bmpPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
     private val tp = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -132,7 +121,7 @@ class GameView(context: Context) : View(context) {
     private val stars = List(70) { Triple(rnd.nextFloat() * 360f, rnd.nextFloat() * 900f, 0.6f + rnd.nextFloat() * 1.8f) }
     private val decor = run {
         val r = Random(42)
-        List(26) { Triple(GX0 - 10f + r.nextFloat() * (GX1 - GX0 + 20f), GY0 - 10f + r.nextFloat() * (GY1 - GY0 + 14f), listOf("🌼", "🌷", "🍄", "🌱", "🌸")[r.nextInt(5)]) }
+        List(26) { Triple(GX0 - 10f + r.nextFloat() * (GX1 - GX0 + 20f), GY0 - 10f + r.nextFloat() * (GY1 - GY0 + 14f), r.nextInt(5)) }
             .sortedBy { it.second }
     }
 
@@ -149,37 +138,52 @@ class GameView(context: Context) : View(context) {
     private var toastText = ""
     private var toastT = 0f
 
-    // игрок
-    private var px = 0f
-    private var py = 0f
-    private var pvx = 0f
-    private var pvy = 0f
-    private var side = -1
-    private var face = 1
-    private var onWall = true
-    private var cling: Pillar? = null
-    private var jumpsLeft = 0
-    private var squash = 0f
-    private var jumpBuf = 0f
-    private var shield = 0f
-    private var boostT = 0f
-    private var shake = 0f
-    private var inCannon: Cannon? = null
-    private var cannonT = 0f
-    private var r = 16f
-    private var hr = 9f
-    private var runLevel = 1
+    // ядро забега: вся физика и мир живут в Sim, здесь только отображение
+    private val sim = Sim()
+    private val lib: List<ChunkTemplate> = try {
+        ChunkLib.parse(resources.openRawResource(R.raw.chunks).bufferedReader().use { it.readText() })
+    } catch (e: Exception) {
+        emptyList()
+    }
+    private val gen = Gen(sim, lib, rnd)
 
-    // забег
-    private var camY = 0f
-    private var lavaY = 0f
-    private var minPy = 0f
-    private var genY = 0f
-    private var lastCannonH = 0f
-    private var calmUntil = Float.POSITIVE_INFINITY
-    private var runTime = 0f
-    private var runCoins = 0f
-    private var coinMul = 1f
+    private val px: Float get() = sim.px
+    private val py: Float get() = sim.py
+    private val pvx: Float get() = sim.pvx
+    private val pvy: Float get() = sim.pvy
+    private val side: Int get() = sim.side
+    private val face: Int get() = sim.face
+    private val onWall: Boolean get() = sim.onWall
+    private val squash: Float get() = sim.squash
+    private val shield: Float get() = sim.shield
+    private val boostT: Float get() = sim.boostT
+    private val inCannon: Cannon? get() = sim.inCannon
+    private val jumpsLeft: Int get() = sim.jumpsLeft
+    private val r: Float get() = sim.r
+    private val hr: Float get() = sim.hr
+    private val camY: Float get() = sim.camY
+    private val lavaY: Float get() = sim.lavaY
+    private val minPy: Float get() = sim.minPy
+    private val runTime: Float get() = sim.time
+    private val runCoins: Float get() = sim.runCoins
+    private val coinMul: Float get() = sim.coinMul
+    private val coins get() = sim.coins
+    private val snacks get() = sim.snacks
+    private val spikes get() = sim.spikes
+    private val saws get() = sim.saws
+    private val orbits get() = sim.orbits
+    private val lasers get() = sim.lasers
+    private val pillars get() = sim.pillars
+    private val cannons get() = sim.cannons
+    private val bumpers get() = sim.bumpers
+
+    private val sawPos = FloatArray(2)
+    private var bossBanner = 0f
+    private var bossHint = 0f
+    private val boss: Boss? get() = sim.boss
+    private var runLevel = 1
+    private var runSkin = 0
+    private var shake = 0f
     private var combo = 0
     private var comboT = 0f
     private var gotSnacks = 0
@@ -187,20 +191,34 @@ class GameView(context: Context) : View(context) {
     private var newRecord = false
     private var earned = 0L
 
-    private val coins = ArrayList<Coin>()
-    private val snacks = ArrayList<Snack>()
-    private val spikes = ArrayList<Spike>()
-    private val saws = ArrayList<Saw>()
-    private val orbits = ArrayList<Orbit>()
-    private val lasers = ArrayList<Laser>()
-    private val pillars = ArrayList<Pillar>()
-    private val cannons = ArrayList<Cannon>()
-    private val bumpers = ArrayList<Bumper>()
+    // жест: тап — прыжок вперёд, свайп влево/вправо — рывок в сторону
+    private var gesturePtr = -1
+    private var gestureX0 = 0f
+    private var gestureDone = false
+
     private val particles = ArrayList<Particle>()
     private val pops = ArrayList<Pop>()
 
     // ферма
-    private val pets = ArrayList<Pet>()
+    private val petLists = Array(Farms.COUNT) { ArrayList<Pet>() }
+    private val pets: ArrayList<Pet> get() = petLists[save.activeFarm]
+    private var viewFarm = 0
+    private var dragPtr = -1
+    private var dragIdx = -1
+    private var dragMoved = false
+    private var dragX0 = 0f
+    private var dragY0 = 0f
+    private val hist = FloatArray(18) // 6 точек: x, y, t
+    private var histN = 0
+    private val snowflakes = List(40) { Triple(rnd.nextFloat() * 360f, rnd.nextFloat() * 300f, 0.5f + rnd.nextFloat()) }
+
+    // гардероб и боксы
+    private var boxStage = 0 // 0 нет, 1 трясётся, 2 открыт
+    private var boxT = 0f
+    private var boxKind = 0
+    private var boxSkin = 0
+    private var boxDup = false
+    private var boxFree = false
     private val farmFoods = ArrayList<FarmFood>()
     private val uiPops = ArrayList<Pop>()
 
@@ -235,6 +253,7 @@ class GameView(context: Context) : View(context) {
     /** true — нажатие «назад» обработано внутри игры. */
     fun onBack(): Boolean = when (scene) {
         Scene.PLAY -> { paused = !paused; true }
+        Scene.WARDROBE -> { if (boxStage == 0) goFarm() else boxStage = 0; true }
         Scene.DEAD, Scene.FARM -> { goMenu(); true }
         Scene.MENU -> false
     }
@@ -246,6 +265,7 @@ class GameView(context: Context) : View(context) {
     }
 
     private fun goFarm() {
+        viewFarm = save.activeFarm
         scene = Scene.FARM
         sceneTime = 0f
         paused = false
@@ -275,10 +295,15 @@ class GameView(context: Context) : View(context) {
         sceneTime += dt
         toastT = max(0f, toastT - dt)
         buttons.clear()
+        if (scene != Scene.PLAY && !modMenuOpen && save.checkBirth()) {
+            sfx.play(Sfx.S.BREED)
+            toast("Родился малыш! 🍼")
+        }
 
         when (scene) {
             Scene.MENU -> drawMenu(c)
             Scene.FARM -> drawFarm(c, dt)
+            Scene.WARDROBE -> drawWardrobe(c, dt)
             Scene.PLAY, Scene.DEAD -> {
                 if (scene == Scene.PLAY && !paused && !modMenuOpen) {
                     var rem = dt
@@ -304,37 +329,89 @@ class GameView(context: Context) : View(context) {
     // =====================================================================
 
     override fun onTouchEvent(e: MotionEvent): Boolean {
-        if (e.actionMasked != MotionEvent.ACTION_DOWN && e.actionMasked != MotionEvent.ACTION_POINTER_DOWN) return true
-        val rx = e.getX(e.actionIndex)
-        val ry = e.getY(e.actionIndex)
+        if (modMenuOpen) return true
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN ->
+                onDown(e.getPointerId(e.actionIndex), e.getX(e.actionIndex), e.getY(e.actionIndex))
+            MotionEvent.ACTION_MOVE -> if (dragPtr >= 0) {
+                val i = e.findPointerIndex(dragPtr)
+                if (i >= 0) farmMove((e.getX(i) - uiOx) / ui, (e.getY(i) - uiOy) / ui)
+            } else if (gesturePtr >= 0 && !gestureDone) {
+                val i = e.findPointerIndex(gesturePtr)
+                if (i >= 0) {
+                    val dx = (e.getX(i) - gestureX0) / scale
+                    if (abs(dx) > SWIPE_U) {
+                        gestureDone = true
+                        swipeDash(if (dx > 0f) 1 else -1)
+                    }
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
+                val pid = e.getPointerId(e.actionIndex)
+                if (pid == gesturePtr) {
+                    if (!gestureDone) tapRelease()
+                    gesturePtr = -1
+                }
+                if (pid == dragPtr) farmUp()
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                gesturePtr = -1
+                if (dragPtr >= 0) farmUp()
+            }
+        }
+        return true
+    }
+
+    private fun onDown(id: Int, rx: Float, ry: Float) {
         val ux = (rx - uiOx) / ui
         val uy = (ry - uiOy) / ui
         if (ux in 276f..350f && uy in 132f..174f) {
+            gesturePtr = -1
+            if (dragPtr >= 0) farmUp()
             showModMenu()
-            return true
+            return
         }
-        if (modMenuOpen) return true
-        if (scene == Scene.PLAY && !paused) {
+        if (scene == Scene.PLAY && !paused && !modMenuOpen) {
             val wx = rx / scale
             val wy = ry / scale
-            if (wx > W - 54f && wy < 70f) {
-                paused = true
-                sfx.play(Sfx.S.CLICK)
-            } else {
-                onTapPlay(wx)
+            when {
+                wx > W - 54f && wy < 70f -> { paused = true; sfx.play(Sfx.S.CLICK) }
+                sim.inCannon != null -> sim.fireCannon()
+                sim.onWall -> sim.jump()
+                sim.jumpsLeft > 0 || mod.infiniteJumps -> { gesturePtr = id; gestureX0 = rx; gestureDone = false }
+                else -> sim.jumpBuf = 0.2f
             }
-            return true
+            return
         }
-        if (scene == Scene.DEAD && sceneTime < 0.5f) return true
+        if (scene == Scene.DEAD && sceneTime < 0.5f) return
         val hit = buttons.asReversed().firstOrNull { ux >= it.x && ux <= it.x + it.w && uy >= it.y && uy <= it.y + it.h }
         if (hit != null) {
             performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
             sfx.play(Sfx.S.CLICK)
             hit.onTap()
         } else if (scene == Scene.FARM) {
-            onFarmTap(ux, uy)
+            farmDown(ux, uy, id)
         }
-        return true
+    }
+
+    /** Палец отпущен без свайпа — это тап: прыжок «вперёд», по ходу движения. */
+    private fun tapRelease() {
+        if (scene != Scene.PLAY || paused || modMenuOpen || sim.dead) return
+        when {
+            sim.inCannon != null -> sim.fireCannon()
+            sim.onWall -> sim.jump()
+            sim.jumpsLeft > 0 || mod.infiniteJumps -> sim.airJump(sim.forwardDir())
+            else -> sim.jumpBuf = 0.2f
+        }
+    }
+
+    private fun swipeDash(dir: Int) {
+        if (scene != Scene.PLAY || paused || modMenuOpen || sim.dead) return
+        when {
+            sim.inCannon != null -> sim.fireCannon()
+            sim.onWall -> sim.jump()
+            sim.jumpsLeft > 0 || mod.infiniteJumps -> sim.airJump(dir)
+        }
     }
 
     // Мод-меню не меняет paused: закрытие сохраняет предыдущую паузу.
@@ -362,7 +439,7 @@ class GameView(context: Context) : View(context) {
             content.addView(Switch(context).apply {
                 text = title
                 isChecked = checked
-                setOnCheckedChangeListener { _, enabled -> action(enabled); mod.save() }
+                setOnCheckedChangeListener { _, enabled -> action(enabled); mod.save(); syncModFlags() }
             })
         }
         fun action(title: String, task: () -> Unit) {
@@ -373,8 +450,8 @@ class GameView(context: Context) : View(context) {
         toggle("Сквозь препятствия (стены остаются)", mod.noCollision) {
             mod.noCollision = it
             if (it && scene == Scene.PLAY) {
-                cling = null; inCannon = null
-                onWall = false; jumpsLeft = MAX_AIR
+                sim.cling = null; sim.inCannon = null
+                sim.onWall = false; sim.jumpsLeft = MAX_AIR
             }
         }
         toggle("Бесконечные прыжки в воздухе", mod.infiniteJumps) { mod.infiniteJumps = it }
@@ -398,14 +475,14 @@ class GameView(context: Context) : View(context) {
                 }
             }
         }
-        label("Ферма: перед первым изменением создаётся копия прогресса. Бонусы сохраняются, откат — кнопкой ниже.")
+        label("Фермы: перед первым бонусом сохраняется весь прогресс (4 фермы, скины и боксы). Бонусы сохраняются, откат — кнопкой ниже.")
         val status = TextView(context)
         content.addView(status)
         fun farmChange(message: String, change: () -> Unit) {
             save.backupForMod()
             change()
             save.save()
-            if (scene == Scene.PLAY) coinMul = save.coinMultiplier()
+            if (scene == Scene.PLAY) sim.coinMul = save.coinMultiplier()
             status.text = message
         }
         action("+100 000 МОНЕТ") {
@@ -416,11 +493,21 @@ class GameView(context: Context) : View(context) {
         action("ВЫБРАННЫЙ ТИЛКАЙО: УРОВЕНЬ 10") {
             farmChange("Выбранный тилкайо: уровень 10") { save.herd[save.selected] = Balance.MAX_FAT }
         }
-        action("СТАДО: 9 ТИЛКАЙО, ВСЕ УРОВНЯ 10") {
+        action("ТЕКУЩАЯ ФЕРМА: 9 ТИЛКАЙО УР. 10") {
             farmChange("Стадо заполнено и откормлено") {
-                while (save.herd.size < Balance.MAX_HERD) save.herd.add(0)
+                while (save.herd.size < Balance.MAX_HERD) save.farm.addPet()
+                save.farm.breedEnd = 0L
                 for (i in save.herd.indices) save.herd[i] = Balance.MAX_FAT
             }
+        }
+        action("ОТКРЫТЬ ВСЕ 4 ФЕРМЫ") {
+            farmChange("Все фермы открыты") { save.unlocked = Farms.COUNT }
+        }
+        action("ОТКРЫТЬ ВСЕ СКИНЫ") {
+            farmChange("Все скины доступны в гардеробе") { save.ownedSkins = (1L shl Skins.all.size) - 1L }
+        }
+        action("+10 БЕСПЛАТНЫХ БОКСОВ") {
+            farmChange("Добавлено 10 боксов") { save.freeBoxes = (save.freeBoxes.toLong() + 10).coerceAtMost(Int.MAX_VALUE.toLong()).toInt() }
         }
         action("ВОССТАНОВИТЬ ПРОГРЕСС ДО БОНУСОВ") {
             if (scene == Scene.PLAY) {
@@ -428,10 +515,14 @@ class GameView(context: Context) : View(context) {
             } else {
                 status.text = if (save.restoreModBackup()) "Прогресс восстановлен" else "Резервной копии ещё нет"
                 farmFoods.clear()
+                petLists.forEach { it.clear() }
+                viewFarm = save.activeFarm
+                dragPtr = -1; dragIdx = -1
+                boxStage = 0
                 syncPets()
             }
         }
-        label("Бонус уровня меняет размер бегуна со следующего забега. Телепорт не собирает пропущенные монеты; даёт щит на 2 секунды.")
+        label("Бонус уровня меняет размер бегуна со следующего забега. Телепорт пропускает текущего босса без награды, не собирает пропущенные монеты; даёт щит на 2 секунды.")
         modDialog = AlertDialog.Builder(context)
             .setTitle("Тилкайо · MOD")
             .setView(ScrollView(context).apply { addView(content) })
@@ -442,420 +533,183 @@ class GameView(context: Context) : View(context) {
             }
     }
 
+    private fun syncModFlags() {
+        sim.godMode = mod.godMode
+        sim.noCollision = mod.noCollision
+        sim.infiniteJumps = mod.infiniteJumps
+    }
+
     private fun teleportForward(meters: Float) {
         if (scene != Scene.PLAY || !ModRules.validMeters(meters)) return
-        py = ModRules.teleportedY(py, meters)
-        px = stickX(-1)
-        pvx = 0f; pvy = 0f
-        side = -1; face = 1
-        onWall = true; cling = null; inCannon = null
-        cannonT = 0f; boostT = 0f; jumpBuf = 0f; jumpsLeft = MAX_AIR
-        shield = max(shield, 2f)
-        minPy = min(minPy, py)
-        camY = py - viewH * 0.62f
-        lavaY = py + 440f
-        // Генерируем только новое видимое окно, а не весь пропущенный путь.
-        coins.clear(); snacks.clear(); spikes.clear(); saws.clear(); orbits.clear(); lasers.clear()
-        pillars.clear(); cannons.clear(); bumpers.clear(); particles.clear(); pops.clear()
-        genY = camY + viewH + 200f
-        lastCannonH = -py
-        calmUntil = py - 200f
-        while (genY > camY - 800f) genChunk()
+        sim.teleportForward(meters)
+        gen.resetAfterTeleport()
+        gen.fill(sim.camY - 800f)
+        gesturePtr = -1
+        bossBanner = 0f; bossHint = 0f
+        particles.clear(); pops.clear()
         ring(px, py, 0xFF64FFDA.toInt())
         sfx.play(Sfx.S.SHIELD)
     }
 
-    private fun onTapPlay(wx: Float) {
-        when {
-            inCannon != null -> fireCannon()
-            onWall -> jump()
-            jumpsLeft > 0 || mod.infiniteJumps -> airJump(if (wx < W / 2) -1 else 1)
-            else -> jumpBuf = 0.2f
-        }
-    }
-
     // =====================================================================
-    // Забег: логика
+    // Забег: связка Sim с эффектами и звуком
     // =====================================================================
-
-    private fun stickX(s: Int) = if (s < 0) WALL + hr else W - WALL - hr
 
     private fun startRun() {
         scene = Scene.PLAY
         sceneTime = 0f
         paused = false
         runLevel = save.level(save.selected)
-        r = 15f + runLevel * 1.7f
-        hr = r * 0.55f
-        side = -1
-        face = 1
-        onWall = true
-        cling = null
-        inCannon = null
-        px = stickX(-1)
-        py = 0f
-        pvx = 0f
-        pvy = 0f
-        squash = 0f
-        jumpBuf = 0f
-        jumpsLeft = MAX_AIR
-        shield = 0f
-        boostT = 0f
+        runSkin = save.skinOf(save.selected)
+        sim.reset(runLevel, save.coinMultiplier(), viewH)
+        syncModFlags()
+        gen.reset()
+        gen.fill(sim.camY - 800f)
         shake = 0f
-        camY = py - viewH * 0.62f
-        lavaY = py + 440f
-        minPy = 0f
-        genY = -150f
-        lastCannonH = 0f
-        calmUntil = Float.POSITIVE_INFINITY
-        runTime = 0f
-        runCoins = 0f
-        coinMul = save.coinMultiplier()
         combo = 0
         comboT = 0f
         gotSnacks = 0
         newRecord = false
-        coins.clear(); snacks.clear(); spikes.clear(); saws.clear(); orbits.clear(); lasers.clear()
-        pillars.clear(); cannons.clear(); bumpers.clear(); particles.clear(); pops.clear()
-    }
-
-    private fun jump() {
-        onWall = false
-        cling = null
-        face = -side
-        pvx = face * JUMP_VX
-        pvy = -JUMP_VY
-        squash = -0.6f
-        jumpBuf = 0f
-        jumpsLeft = MAX_AIR
-        performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-        sfx.play(Sfx.S.JUMP)
-        dust(px, py, 6, 0xFFFFFFFF.toInt())
-    }
-
-    private fun airJump(d: Int) {
-        if (!mod.infiniteJumps) jumpsLeft--
-        face = d
-        pvx = d * JUMP_VX
-        pvy = -AIR_VY
-        squash = -0.5f
-        sfx.play(Sfx.S.AIR, 1f + (MAX_AIR - jumpsLeft) * 0.12f)
-        ring(px, py, 0xFF9BE7FF.toInt())
-    }
-
-    private fun land(s: Int, pl: Pillar?) {
-        side = s
-        cling = pl
-        px = if (pl == null) stickX(s) else if (s > 0) pl.x0 - hr else pl.x1 + hr
-        onWall = true
-        pvx = 0f
-        pvy = 0f
-        squash = 1f
-        jumpsLeft = MAX_AIR
-        sfx.play(Sfx.S.LAND, 0.9f + rnd.nextFloat() * 0.2f, 0.7f)
-        dust(px - s * r * 0.3f, py, 8, 0xFFE0D6FF.toInt())
-        if (jumpBuf > 0f) jump()
-    }
-
-    private fun fireCannon() {
-        val cn = inCannon ?: return
-        cn.used = true
-        inCannon = null
-        val a = cn.ang
-        pvx = sin(a) * 860f
-        pvy = -cos(a) * 860f
-        px = cn.x + sin(a) * 34f
-        py = cn.y - cos(a) * 34f
-        boostT = 0.9f
-        shield = 2.8f
-        jumpsLeft = MAX_AIR
-        onWall = false
-        cling = null
-        shake = 0.35f
-        sfx.play(Sfx.S.CAN_FIRE)
-        sfx.play(Sfx.S.SHIELD)
-        performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-        for (i in 0 until 20) {
-            val ang = a + (rnd.nextFloat() - 0.5f) * 1.2f
-            val sp = 120f + rnd.nextFloat() * 260f
-            particles.add(Particle(cn.x, cn.y, sin(ang) * sp, -cos(ang) * sp, 0.6f, 0.6f, 0xFFFFC107.toInt(), 3f + rnd.nextFloat() * 4f))
-        }
+        gesturePtr = -1
+        bossBanner = 0f
+        bossHint = 0f
+        particles.clear()
+        pops.clear()
     }
 
     private fun stepPlay(dt: Float) {
-        runTime += dt
-        squash += (0f - squash) * min(1f, dt * 9f)
-        jumpBuf = max(0f, jumpBuf - dt)
-        shield = max(0f, shield - dt)
-        shake = max(0f, shake - dt)
         comboT = max(0f, comboT - dt)
         if (comboT <= 0f) combo = 0
-        for (b in bumpers) b.pop = max(0f, b.pop - dt)
+        shake = max(0f, shake - dt)
+        bossBanner = max(0f, bossBanner - dt)
+        bossHint = max(0f, bossHint - dt)
+        for (b in sim.bumpers) b.pop = max(0f, b.pop - dt)
 
-        val cn = inCannon
-        if (cn != null) {
-            cannonT += dt
-            cn.ang = sin(cannonT * 2.4f) * 0.95f
-            px = cn.x
-            py = cn.y
-            if (cannonT > 2.4f) fireCannon()
-        } else if (onWall) {
-            py += SLIDE * dt
-            val pl = cling
-            if (pl != null && py - hr * 0.3f > pl.y1) {
-                onWall = false
-                cling = null
-                pvx = 0f
-                pvy = 60f
-            }
-        } else {
-            val g = if (boostT > 0f) GRAV * 0.12f else GRAV
-            boostT = max(0f, boostT - dt)
-            pvy = min(pvy + g * dt, 950f)
-            px += pvx * dt
-            py += pvy * dt
-            if (pvx != 0f) face = if (pvx > 0f) 1 else -1
-            if (boostT > 0f && rnd.nextFloat() < 0.6f) {
-                particles.add(Particle(px, py, (rnd.nextFloat() - 0.5f) * 40f, 40f, 0.4f, 0.4f, 0xFFFFB74D.toInt(), 3f + rnd.nextFloat() * 3f))
-            }
-            if (!mod.noCollision) collidePillars()
-            if (!onWall) collideScreenWalls()
+        syncModFlags()
+        sim.step(dt)
+        gen.fill(sim.camY - 800f)
+        handleEvents()
+        sim.cleanup()
+
+        if (sim.boostT > 0f && rnd.nextFloat() < 0.6f) {
+            particles.add(Particle(sim.px, sim.py, (rnd.nextFloat() - 0.5f) * 40f, 40f, 0.4f, 0.4f, 0xFFFFB74D.toInt(), 3f + rnd.nextFloat() * 3f))
         }
-        if (py < minPy) minPy = py
+        if (sim.dead) { finishRun(); return }
 
-        // камера идёт только вверх
-        val target = py - viewH * 0.62f
-        if (target < camY) camY += (target - camY) * min(1f, dt * 7f)
-
-        // лава
-        val height = -minPy
-        lavaY -= (30f + min(70f, height / 20f)) * dt
-        lavaY = min(lavaY, py + 500f)
-        if (!mod.godMode && !mod.noCollision && shield <= 0f && py + hr > lavaY) return die("Тилкайо сгорел в лаве 🔥")
-        if (py - hr > camY + viewH + 20f) return die("Упал вниз 😵")
-
-        while (genY > camY - 800f) genChunk()
-
-        val invuln = mod.godMode || mod.noCollision || shield > 0f || inCannon != null
-        checkHazards(dt, invuln)
-        if (scene != Scene.PLAY) return
-        checkPickups()
-
+        val height = -sim.minPy
         if (!newRecord && save.best > 0 && (height / 10f).toInt() > save.best) {
             newRecord = true
             sfx.play(Sfx.S.RECORD)
-            pops.add(Pop(W / 2, camY + viewH * 0.3f, "НОВЫЙ РЕКОРД!", 0xFFFFD54F.toInt(), 26f))
-        }
-
-        val bottom = camY + viewH + 200f
-        coins.removeAll { it.got || it.y > bottom }
-        snacks.removeAll { it.got || it.y > bottom }
-        spikes.removeAll { it.y0 > bottom }
-        saws.removeAll { it.y > bottom + 100f && it.y0 > bottom }
-        orbits.removeAll { it.cy > bottom + 100f }
-        lasers.removeAll { it.y > bottom }
-        pillars.removeAll { it.y0 > bottom }
-        cannons.removeAll { it.y > bottom }
-        bumpers.removeAll { it.y > bottom }
-    }
-
-    private fun collideScreenWalls() {
-        val lx = stickX(-1)
-        val rx = stickX(1)
-        if (px <= lx) {
-            if (boostT > 0f) { px = lx; pvx = abs(pvx) } else if (pvx <= 0f) land(-1, null)
-        } else if (px >= rx) {
-            if (boostT > 0f) { px = rx; pvx = -abs(pvx) } else if (pvx >= 0f) land(1, null)
+            pops.add(Pop(W / 2, sim.camY + viewH * 0.3f, "НОВЫЙ РЕКОРД!", 0xFFFFD54F.toInt(), 26f))
         }
     }
 
-    private fun collidePillars() {
-        for (pl in pillars) {
-            if (pl.hot) continue
-            val nx = px.coerceIn(pl.x0, pl.x1)
-            val ny = py.coerceIn(pl.y0, pl.y1)
-            val dx = px - nx
-            val dy = py - ny
-            if (dx * dx + dy * dy >= hr * hr) continue
-            val cx = (pl.x0 + pl.x1) / 2
-            val cy = (pl.y0 + pl.y1) / 2
-            val inX = px >= pl.x0 && px <= pl.x1
-            val inY = py >= pl.y0 && py <= pl.y1
-            val sideHit = if (inX) false else if (inY) true else abs(dx) > abs(dy)
-            if (sideHit) {
-                if (boostT > 0f) { pvx = -pvx; px = if (px < cx) pl.x0 - hr else pl.x1 + hr }
-                else land(if (px < cx) 1 else -1, pl)
-                return
-            } else if (py < cy) {
-                // приземлился на верхушку — соскальзывает
-                py = pl.y0 - hr
-                pvx = if (px < cx) -150f else 150f
-                pvy = 40f
-            } else {
-                py = pl.y1 + hr
-                pvy = max(pvy, 120f)
-            }
-        }
-    }
-
-    private fun checkHazards(dt: Float, invuln: Boolean) {
-        // шипы на стенах
-        if (!invuln) {
-            for (s in spikes) {
-                val x0 = if (s.left) WALL else W - WALL - SPIKE_LEN
-                if (circleRect(px, py, hr, x0, s.y0, x0 + SPIKE_LEN, s.y1)) return die("Наколол попу на шипы 📌")
-            }
-            for (pl in pillars) {
-                if (pl.hot && circleRect(px, py, hr, pl.x0 - 9f, pl.y0, pl.x1 + 9f, pl.y1)) return die("Обжёгся о раскалённый столб 🌋")
-            }
-        }
-        // пилы
-        val it = saws.iterator()
-        while (it.hasNext()) {
-            val s = it.next()
-            s.x += s.vx * dt
-            s.y += s.vy * dt
-            if (s.x < s.x0) { s.x = s.x0; s.vx = abs(s.vx) }
-            if (s.x > s.x1) { s.x = s.x1; s.vx = -abs(s.vx) }
-            if (s.y < s.y0) { s.y = s.y0; s.vy = abs(s.vy) }
-            if (s.y > s.y1) { s.y = s.y1; s.vy = -abs(s.vy) }
-            s.ang += dt * 9f
-            if (inCannon != null || mod.noCollision || (mod.godMode && shield <= 0f)) continue
-            val dx = s.x - px
-            val dy = s.y - py
-            val rr = hr + 13f
-            if (dx * dx + dy * dy < rr * rr) {
-                if (shield > 0f) {
-                    smash(s.x, s.y)
-                    it.remove()
-                } else return die("Распилило пополам ⚙️")
-            }
-        }
-        for (o in orbits) {
-            o.a += o.spd * dt
-            if (inCannon != null || mod.noCollision || (mod.godMode && shield <= 0f)) continue
-            for (i in 0 until o.n) {
-                if (!o.alive[i]) continue
-                val a = o.a + i * 2f * PI.toFloat() / o.n
-                val sx = o.cx + cos(a) * o.rad
-                val sy = o.cy + sin(a) * o.rad
-                val dx = sx - px
-                val dy = sy - py
-                val rr = hr + 12f
-                if (dx * dx + dy * dy < rr * rr) {
-                    if (shield > 0f) { smash(sx, sy); o.alive[i] = false } else return die("Закрутило пилами 🌀")
+    private fun handleEvents() {
+        for (ev in sim.events) {
+            when (ev.type) {
+                Ev.JUMP -> {
+                    performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                    sfx.play(Sfx.S.JUMP)
+                    dust(ev.x, ev.y, 6, 0xFFFFFFFF.toInt())
                 }
-            }
-        }
-        // лазеры
-        for (l in lasers) {
-            val t = (runTime + l.phase) % l.period
-            val on = t < l.onTime
-            if (!on && t > l.period - 0.06f) sfx.play(Sfx.S.LASER, 1.4f, 0.4f)
-            if (on && !invuln && abs(py - l.y) < hr + 4f) return die("Поджарило лазером ⚡")
-        }
-        // бамперы
-        for (b in bumpers) {
-            val dx = px - b.x
-            val dy = py - b.y
-            val rr = hr + 17f
-            val d2 = dx * dx + dy * dy
-            if (d2 < rr * rr && b.pop <= 0f && inCannon == null && !mod.noCollision) {
-                val d = max(1f, sqrt(d2))
-                pvx = dx / d * 500f
-                pvy = dy / d * 500f - 140f
-                onWall = false
-                cling = null
-                face = if (pvx > 0f) 1 else -1
-                jumpsLeft = max(jumpsLeft, 1)
-                b.pop = 0.3f
-                sfx.play(Sfx.S.BUMP, 0.9f + rnd.nextFloat() * 0.3f)
-                ring(b.x, b.y, 0xFFFF8AD8.toInt())
-            }
-        }
-        // пушки
-        if (inCannon == null && boostT <= 0f && !mod.noCollision) {
-            for (cn in cannons) {
-                if (cn.used) continue
-                if (hypot(cn.x - px, cn.y - py) < 30f) {
-                    inCannon = cn
-                    cannonT = 0f
-                    px = cn.x; py = cn.y
-                    pvx = 0f; pvy = 0f
-                    onWall = false
-                    cling = null
-                    sfx.play(Sfx.S.CAN_IN)
-                    break
+                Ev.AIR -> {
+                    sfx.play(Sfx.S.AIR, 1f + (MAX_AIR - sim.jumpsLeft) * 0.12f)
+                    ring(ev.x, ev.y, 0xFF9BE7FF.toInt())
                 }
+                Ev.LAND -> {
+                    sfx.play(Sfx.S.LAND, 0.9f + rnd.nextFloat() * 0.2f, 0.7f)
+                    dust(ev.x - sim.side * sim.r * 0.3f, ev.y, 8, 0xFFE0D6FF.toInt())
+                }
+                Ev.COIN -> {
+                    combo++
+                    comboT = 0.7f
+                    sfx.play(Sfx.S.COIN, min(1.9f, 1f + combo * 0.06f))
+                    sparkle(ev.x, ev.y, 0xFFFFD54F.toInt())
+                    pops.add(Pop(ev.x, ev.y - 8f, "+" + fmt(sim.coinMul), 0xFFFFE082.toInt(), 13f))
+                }
+                Ev.SNACK -> {
+                    val sn = ev.ref as Snack
+                    gotSnacks++
+                    save.herd[save.selected] = min(Balance.MAX_FAT, save.herd[save.selected] + sn.fat)
+                    save.save()
+                    sfx.play(Sfx.S.EAT)
+                    sparkle(sn.x, sn.y, 0xFFFF8A65.toInt())
+                    pops.add(Pop(sn.x, sn.y - 10f, "ням! +${sn.fat} жира", 0xFFFFAB91.toInt(), 14f))
+                }
+                Ev.SMASH -> {
+                    sfx.play(Sfx.S.SMASH)
+                    shake = max(shake, 0.15f)
+                    sparkle(ev.x, ev.y, 0xFFCFD8DC.toInt())
+                    pops.add(Pop(ev.x, ev.y - 10f, "+" + fmt(sim.coinMul * 3), 0xFFFFE082.toInt(), 16f))
+                }
+                Ev.CANNON_IN -> sfx.play(Sfx.S.CAN_IN)
+                Ev.CANNON_FIRE -> {
+                    val a = ev.ref as Float
+                    shake = 0.35f
+                    sfx.play(Sfx.S.CAN_FIRE)
+                    sfx.play(Sfx.S.SHIELD)
+                    performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                    for (i in 0 until 20) {
+                        val ang = a + (rnd.nextFloat() - 0.5f) * 1.2f
+                        val sp = 120f + rnd.nextFloat() * 260f
+                        particles.add(Particle(ev.x, ev.y, sin(ang) * sp, -cos(ang) * sp, 0.6f, 0.6f, 0xFFFFC107.toInt(), 3f + rnd.nextFloat() * 4f))
+                    }
+                }
+                Ev.BUMP -> {
+                    (ev.ref as Bumper).pop = 0.3f
+                    sfx.play(Sfx.S.BUMP, 0.9f + rnd.nextFloat() * 0.3f)
+                    ring(ev.x, ev.y, 0xFFFF8AD8.toInt())
+                }
+                Ev.BOSS_START -> {
+                    bossBanner = 3f
+                    bossHint = 6f
+                    shake = 0.5f
+                    sfx.play(Sfx.S.BOSS_ROAR)
+                    performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                }
+                Ev.BOSS_TELE -> sfx.play(Sfx.S.WARN)
+                Ev.BOSS_FIRE -> sfx.play(Sfx.S.LASER, 0.8f, 0.5f)
+                Ev.BOSS_HIT -> {
+                    shake = 0.45f
+                    bossHint = 0f
+                    sfx.play(Sfx.S.BOSS_HIT)
+                    performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                    sparkle(ev.x, ev.y, 0xFFFFFFFF.toInt())
+                    for (i in 0 until 14) {
+                        val a = rnd.nextFloat() * 2f * PI.toFloat()
+                        val sp = 100f + rnd.nextFloat() * 200f
+                        particles.add(Particle(ev.x, ev.y - 20f, cos(a) * sp, sin(a) * sp - 80f, 0.7f, 0.7f, 0xFFB0BEC5.toInt(), 3f + rnd.nextFloat() * 3f))
+                    }
+                    pops.add(Pop(ev.x, ev.y - 70f, "БАМ!", 0xFFFFD54F.toInt(), 26f))
+                }
+                Ev.BOSS_DEAD -> {
+                    shake = 0.7f
+                    sfx.play(Sfx.S.BOSS_DEAD)
+                    save.freeBoxes++
+                    save.save()
+                    pops.add(Pop(W / 2, sim.camY + viewH * 0.3f + 70f, "🎁 бесплатный бокс со скином!", 0xFFFFFFFF.toInt(), 16f))
+                    pops.add(Pop(W / 2, sim.camY + viewH * 0.3f, "ПОБЕДА!", 0xFFFFD54F.toInt(), 34f))
+                    pops.add(Pop(W / 2, sim.camY + viewH * 0.3f + 40f, "+" + fmt(sim.coinMul * 150f) + " монет", 0xFFFFE082.toInt(), 18f))
+                    for (i in 0 until 40) {
+                        val a = rnd.nextFloat() * 2f * PI.toFloat()
+                        val sp = 80f + rnd.nextFloat() * 280f
+                        particles.add(Particle(ev.x, ev.y, cos(a) * sp, sin(a) * sp - 120f, 1.2f, 1.2f, blockColors[i % 5], 3f + rnd.nextFloat() * 4f))
+                    }
+                }
+                Ev.LASER_ON -> if (ev.y > sim.camY && ev.y < sim.camY + viewH) sfx.play(Sfx.S.LASER, 1.4f, 0.4f)
             }
         }
+        sim.events.clear()
     }
 
-    private fun sqrt(v: Float) = kotlin.math.sqrt(v)
-
-    private fun smash(x: Float, y: Float) {
-        sfx.play(Sfx.S.SMASH)
-        shake = max(shake, 0.15f)
-        sparkle(x, y, 0xFFCFD8DC.toInt())
-        runCoins += coinMul * 3
-        pops.add(Pop(x, y - 10f, "+" + fmt(coinMul * 3), 0xFFFFE082.toInt(), 16f))
-    }
-
-    private fun checkPickups() {
-        for (co in coins) {
-            if (co.got) continue
-            val dx = co.x - px
-            val dy = co.y - py
-            val rr = hr + 22f
-            if (dx * dx + dy * dy < rr * rr) {
-                co.got = true
-                runCoins += coinMul
-                combo++
-                comboT = 0.7f
-                sfx.play(Sfx.S.COIN, min(1.9f, 1f + combo * 0.06f))
-                sparkle(co.x, co.y, 0xFFFFD54F.toInt())
-                pops.add(Pop(co.x, co.y - 8f, "+" + fmt(coinMul), 0xFFFFE082.toInt(), 13f))
-            }
-        }
-        for (sn in snacks) {
-            if (sn.got) continue
-            val dx = sn.x - px
-            val dy = sn.y - py
-            val rr = hr + 22f
-            if (dx * dx + dy * dy < rr * rr) {
-                sn.got = true
-                gotSnacks++
-                save.herd[save.selected] = min(Balance.MAX_FAT, save.herd[save.selected] + sn.fat)
-                save.save()
-                sfx.play(Sfx.S.EAT)
-                sparkle(sn.x, sn.y, 0xFFFF8A65.toInt())
-                pops.add(Pop(sn.x, sn.y - 10f, "ням! +${sn.fat} жира", 0xFFFFAB91.toInt(), 14f))
-            }
-        }
-    }
-
-    private fun die(reason: String) {
-        if (mod.godMode || mod.noCollision) {
-            // Не оставляем бессмертного игрока за нижним краем камеры.
-            if (py - hr > camY + viewH + 20f) {
-                py = camY + viewH * 0.62f
-                px = stickX(-1)
-                onWall = true
-                cling = null
-                inCannon = null
-                pvx = 0f; pvy = 0f
-                jumpsLeft = MAX_AIR
-                lavaY = py + 440f
-            }
-            return
-        }
-        deathReason = reason
+    private fun finishRun() {
+        deathReason = sim.deathReason
         scene = Scene.DEAD
         sceneTime = 0f
-        inCannon = null
-        earned = runCoins.toLong()
+        gesturePtr = -1
+        earned = sim.runCoins.toLong()
         save.coins += earned
-        val score = (-minPy / 10f).toInt()
+        val score = (-sim.minPy / 10f).toInt()
         if (score > save.best) save.best = score
         save.save()
         sfx.play(Sfx.S.DEATH)
@@ -863,234 +717,8 @@ class GameView(context: Context) : View(context) {
         for (i in 0 until 28) {
             val a = rnd.nextFloat() * 2f * PI.toFloat()
             val sp = 80f + rnd.nextFloat() * 220f
-            particles.add(Particle(px, py, cos(a) * sp, sin(a) * sp - 90f, 0.9f, 0.9f, 0xFFFFB74D.toInt(), 3f + rnd.nextFloat() * 4f))
+            particles.add(Particle(sim.px, sim.py, cos(a) * sp, sin(a) * sp - 90f, 0.9f, 0.9f, 0xFFFFB74D.toInt(), 3f + rnd.nextFloat() * 4f))
         }
-    }
-
-    private fun circleRect(cx: Float, cy: Float, rad: Float, x0: Float, y0: Float, x1: Float, y1: Float): Boolean {
-        val nx = cx.coerceIn(x0, x1)
-        val ny = cy.coerceIn(y0, y1)
-        val dx = cx - nx
-        val dy = cy - ny
-        return dx * dx + dy * dy < rad * rad
-    }
-
-    // ---------- генерация чанков ----------
-
-    private fun coin(x: Float, y: Float) { coins.add(Coin(x, y)) }
-
-    private fun coinLine(x0: Float, y0: Float, x1: Float, y1: Float, n: Int) {
-        for (i in 0 until n) {
-            val t = if (n == 1) 0.5f else i / (n - 1f)
-            coin(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)
-        }
-    }
-
-    private fun pickWeighted(ids: List<Int>, ws: List<Float>): Int {
-        var tot = 0f
-        for (w in ws) tot += w
-        var x = rnd.nextFloat() * tot
-        for (i in ids.indices) {
-            x -= ws[i]
-            if (x <= 0f) return ids[i]
-        }
-        return ids.last()
-    }
-
-    private fun genChunk() {
-        val y = genY
-        val h = -y
-        val d = min(1f, h / 3500f)
-        val calm = y > calmUntil
-        val fl = WALL + 26f
-        val fr = W - WALL - 26f
-        val mid = W / 2
-
-        var id: Int
-        if (!calm && h > 350f && h - lastCannonH > 1700f) {
-            id = 11
-        } else {
-            val ids = ArrayList<Int>()
-            val ws = ArrayList<Float>()
-            fun add(i: Int, w: Float, minH: Float = 0f) {
-                if (h >= minH && (!calm || i == 0 || i == 12)) { ids.add(i); ws.add(w) }
-            }
-            add(0, 2.5f); add(1, 3f, 200f); add(2, 2f, 500f); add(3, 3f, 120f); add(4, 2f, 600f)
-            add(5, 2.5f, 400f); add(6, 2f, 600f); add(7, 1.5f, 900f); add(8, 1.5f, 1100f)
-            add(9, 1.5f, 1300f); add(10, 1.5f, 500f); add(12, 0.8f, 150f); add(13, 1.5f, 1000f)
-            id = pickWeighted(ids, ws)
-        }
-        if (h < 100f) id = 0
-
-        val ch: Float
-        when (id) {
-            0 -> { // фигуры из монеток
-                when (rnd.nextInt(6)) {
-                    0 -> for (i in 0 until 8) { // волна
-                        val t = i / 7f
-                        coin(fl + (fr - fl) * t, y - 70f + sin(t * 2f * PI.toFloat()) * 40f)
-                    }
-                    1 -> { // колонна
-                        val x = fl + 30f + rnd.nextFloat() * (fr - fl - 60f)
-                        coinLine(x, y - 20f, x, y - 150f, 6)
-                    }
-                    2 -> { // кольцо
-                        val cx = fl + 60f + rnd.nextFloat() * (fr - fl - 120f)
-                        for (i in 0 until 10) {
-                            val a = i * 2f * PI.toFloat() / 10f
-                            coin(cx + cos(a) * 40f, y - 85f + sin(a) * 40f)
-                        }
-                    }
-                    3 -> if (rnd.nextBoolean()) coinLine(fl, y - 10f, fr, y - 140f, 7) else coinLine(fr, y - 10f, fl, y - 140f, 7)
-                    4 -> { // две колонны у стен
-                        coinLine(fl - 8f, y - 20f, fl - 8f, y - 140f, 5)
-                        coinLine(fr + 8f, y - 20f, fr + 8f, y - 140f, 5)
-                    }
-                    else -> { // сердечко
-                        for (i in 0 until 16) {
-                            val t = i * 2f * PI.toFloat() / 16f
-                            val hx = 16f * sin(t).let { it * it * it }
-                            val hy = 13f * cos(t) - 5f * cos(2 * t) - 2f * cos(3 * t) - cos(4 * t)
-                            coin(mid + hx * 2.6f, y - 90f - hy * 2.6f)
-                        }
-                    }
-                }
-                ch = 170f
-            }
-            1 -> { // шипы на стене
-                val onLeft = rnd.nextBoolean()
-                val len = 70f + rnd.nextFloat() * 30f * (0.5f + d)
-                val y0 = y - 30f - len
-                spikes.add(Spike(onLeft, y0, y0 + len))
-                val ox = if (onLeft) W - WALL - 40f else WALL + 40f
-                coinLine(ox, y0 + len, ox, y0 - 20f, 5)
-                ch = len + 120f
-            }
-            2 -> { // лесенка из шипов
-                val s0 = rnd.nextBoolean()
-                for (i in 0 until 3) {
-                    val left = (i % 2 == 0) == s0
-                    val yk = y - 40f - i * 135f
-                    spikes.add(Spike(left, yk - 70f, yk))
-                    coin(if (left) W - WALL - 38f else WALL + 38f, yk - 35f)
-                }
-                ch = 430f
-            }
-            3 -> { // столб посередине
-                val hgt = 130f + rnd.nextFloat() * 80f
-                val cx = mid + (rnd.nextFloat() - 0.5f) * 140f
-                val y1 = y - 20f
-                pillars.add(Pillar(cx - 13f, y1 - hgt, cx + 13f, y1, false))
-                coinLine(cx - 40f, y1 - 10f, cx - 40f, y1 - hgt, 4)
-                coinLine(cx + 40f, y1 - 10f, cx + 40f, y1 - hgt, 4)
-                coin(cx, y1 - hgt - 30f)
-                ch = hgt + 100f
-            }
-            4 -> { // два столба
-                val hA = 150f + rnd.nextFloat() * 50f
-                val hB = 150f + rnd.nextFloat() * 50f
-                val y1 = y - 20f
-                val ax = 100f + rnd.nextFloat() * 10f
-                val bx = 260f - rnd.nextFloat() * 10f
-                pillars.add(Pillar(ax - 13f, y1 - hA, ax + 13f, y1, false))
-                pillars.add(Pillar(bx - 13f, y1 - 100f - hB, bx + 13f, y1 - 100f, false))
-                coinLine(mid, y1 - 10f, mid, y1 - 190f, 7)
-                ch = 100f + max(hA, hB) + 110f
-            }
-            5 -> { // статичные пилы с проходом
-                val rows = if (d > 0.25f) 2 else 1
-                val gapSlots = if (d > 0.5f) 1 else 2
-                for (rr in 0 until rows) {
-                    val ry = y - 50f - rr * 150f
-                    val g = rnd.nextInt(6 - gapSlots)
-                    for (i in 0 until 5) {
-                        if (i >= g && i < g + gapSlots) continue
-                        val sx = 62f + i * 59f
-                        saws.add(Saw(sx, ry, sx, sx, ry, ry, 0f, 0f))
-                    }
-                    val gx = 62f + (g + (gapSlots - 1) / 2f) * 59f
-                    coin(gx, ry); coin(gx, ry - 32f)
-                }
-                ch = rows * 150f + 70f
-            }
-            6 -> { // пила на рельсе
-                val span = 170f
-                val x0 = fl + rnd.nextFloat() * (fr - fl - span)
-                val sy = y - 70f
-                val spd = (90f + 70f * d) * (if (rnd.nextBoolean()) 1f else -1f)
-                saws.add(Saw(x0 + rnd.nextFloat() * span, sy, x0, x0 + span, sy, sy, spd, 0f))
-                coinLine(fl + 10f, sy - 50f, fr - 10f, sy - 50f, 6)
-                var extra = 0f
-                if (d > 0.5f) {
-                    val x2 = fl + rnd.nextFloat() * (fr - fl - span)
-                    saws.add(Saw(x2, sy - 120f, x2, x2 + span, sy - 120f, sy - 120f, -spd, 0f))
-                    extra = 120f
-                }
-                ch = 190f + extra
-            }
-            7 -> { // вертикальная пила
-                val cx = fl + 30f + rnd.nextFloat() * (fr - fl - 60f)
-                val spd = (90f + 60f * d) * (if (rnd.nextBoolean()) 1f else -1f)
-                saws.add(Saw(cx, y - 130f, cx, cx, y - 230f, y - 40f, 0f, spd))
-                coinLine(cx - 50f, y - 40f, cx - 50f, y - 230f, 6)
-                coinLine(cx + 50f, y - 40f, cx + 50f, y - 230f, 6)
-                ch = 280f
-            }
-            8 -> { // вращающиеся пилы
-                val cx = mid + (rnd.nextFloat() - 0.5f) * 60f
-                val spd = (1.5f + d) * (if (rnd.nextBoolean()) 1f else -1f)
-                orbits.add(Orbit(cx, y - 140f, 58f, rnd.nextFloat() * 6.28f, spd, if (d > 0.5f) 3 else 2))
-                coin(cx, y - 140f)
-                coinLine(fl, y - 60f, fl, y - 220f, 4)
-                coinLine(fr, y - 60f, fr, y - 220f, 4)
-                ch = 290f
-            }
-            9 -> { // лазер
-                val ly = y - 90f
-                lasers.add(Laser(ly, 3.2f, 1.1f, rnd.nextFloat() * 3.2f))
-                coinLine(fl + 20f, ly - 45f, fr - 20f, ly - 45f, 6)
-                ch = 190f
-            }
-            10 -> { // бамперы
-                bumpers.add(Bumper(mid - 75f, y - 50f))
-                bumpers.add(Bumper(mid + 75f, y - 120f))
-                bumpers.add(Bumper(mid - 20f, y - 195f))
-                coinLine(mid - 75f, y - 80f, mid + 75f, y - 150f, 4)
-                ch = 260f
-            }
-            11 -> { // пушка
-                val cx = mid + (rnd.nextFloat() - 0.5f) * 100f
-                cannons.add(Cannon(cx, y - 90f))
-                for (i in 0 until 6) {
-                    val a = PI.toFloat() * (0.15f + i * 0.14f)
-                    coin(cx + cos(a) * 55f, y - 90f + sin(a) * 40f)
-                }
-                for (i in 0 until 18) coin(mid + sin(i * 0.5f) * 60f, y - 270f - i * 34f)
-                lastCannonH = h
-                calmUntil = y - 1000f
-                ch = 260f
-            }
-            12 -> { // вкусняшка
-                snacks.add(
-                    when (rnd.nextInt(3)) {
-                        0 -> Snack(mid, y - 60f, "🥕", 20)
-                        1 -> Snack(mid, y - 60f, "🍔", 50)
-                        else -> Snack(mid, y - 60f, "🍰", 80)
-                    },
-                )
-                ch = 140f
-            }
-            else -> { // раскалённый столб
-                val hgt = 150f + rnd.nextFloat() * 40f
-                val cx = mid + (rnd.nextFloat() - 0.5f) * 120f
-                val y1 = y - 20f
-                pillars.add(Pillar(cx - 13f, y1 - hgt, cx + 13f, y1, true))
-                coinLine(cx - 50f, y1 - 10f, cx - 50f, y1 - hgt, 4)
-                coinLine(cx + 50f, y1 - 10f, cx + 50f, y1 - hgt, 4)
-                ch = hgt + 110f
-            }
-        }
-        genY -= ch
     }
 
     // ---------- эффекты ----------
@@ -1219,20 +847,66 @@ class GameView(context: Context) : View(context) {
     private fun fmt(v: Float) = if (v == floor(v)) v.toInt().toString() else "%.1f".format(v)
 
     /** Рисует тилкайо с центром в (cx, cy); rad — «радиус пузика». */
+    private val silhouette = ColorMatrixColorFilter(
+        ColorMatrix(floatArrayOf(0f, 0f, 0f, 0f, 22f, 0f, 0f, 0f, 0f, 18f, 0f, 0f, 0f, 0f, 38f, 0f, 0f, 0f, 1f, 0f)),
+    )
+
+    /** Рисует тилкайо с центром в (cx, cy); rad — «радиус пузика». [skin] — номер скина, [hidden] — чёрный силуэт. */
     private fun drawTilcayo(
-        c: Canvas, cx: Float, cy: Float, rad: Float, faceDir: Int, rot: Float,
-        sx: Float, sy: Float, level: Int,
+        c: Canvas, cx: Float, cy0: Float, rad: Float, faceDir: Int, rot: Float,
+        sx: Float, sy: Float, level: Int, skin: Int = 0, hidden: Boolean = false,
     ) {
+        val sk = Skins.all[skin]
         val w = rad * 2.5f
         val h = w * sprite.height / sprite.width
+        val cy = if (sk.fx == Skin.FX_GHOST && !hidden) cy0 - rad * 0.12f + sin(anim * 3f) * rad * 0.1f else cy0
+        if (sk.fx == Skin.FX_FIRE && !hidden) {
+            val fl = 0.85f + 0.2f * sin(anim * 12f)
+            text(c, "🔥", cx - faceDir * w * 0.44f, cy + h * 0.14f, rad * 0.8f * fl, shadow = false)
+            text(c, "🔥", cx + faceDir * w * 0.46f, cy + h * 0.2f, rad * 0.6f * (2f - fl), shadow = false)
+        }
         c.save()
         c.translate(cx, cy)
         c.rotate(rot)
         c.scale(sx * faceDir, sy)
         rect.set(-w / 2, -h / 2, w / 2, h / 2)
+        if (hidden) {
+            bmpPaint.colorFilter = silhouette
+        } else {
+            bmpPaint.colorFilter = Skins.filter(skin, anim)
+            bmpPaint.alpha = (sk.alpha * 255).toInt()
+        }
         c.drawBitmap(sprite, null, rect, bmpPaint)
+        bmpPaint.colorFilter = null
+        bmpPaint.alpha = 255
         c.restore()
-        if (level >= Balance.MAX_LEVEL) text(c, "👑", cx + faceDir * w * 0.02f, cy - h * 0.46f * sy, rad * 0.95f, shadow = false)
+        if (hidden) return
+
+        val crown = level >= Balance.MAX_LEVEL && sk.acc != "👑"
+        if (crown) text(c, "👑", cx + faceDir * w * 0.02f, cy - h * 0.46f * sy, rad * 0.95f, shadow = false)
+        val acc = sk.acc
+        if (acc != null) {
+            if (sk.accOnEyes) {
+                text(c, acc, cx + faceDir * w * 0.1f, cy - h * 0.02f * sy, rad * 0.9f, shadow = false)
+            } else if (crown) {
+                text(c, acc, cx - faceDir * w * 0.3f, cy - h * 0.38f * sy, rad * 0.7f, shadow = false)
+            } else {
+                text(c, acc, cx + faceDir * w * 0.02f, cy - h * 0.46f * sy, rad * 0.95f, shadow = false)
+            }
+        }
+        when (sk.fx) {
+            Skin.FX_SPARK -> for (i in 0 until 3) {
+                val a = anim * 1.7f + i * 2.1f
+                val tw = 0.5f + 0.5f * sin(anim * 5f + i * 2f)
+                text(c, "✨", cx + cos(a) * w * 0.5f, cy + sin(a * 1.3f) * h * 0.42f, rad * (0.35f + 0.35f * tw), shadow = false)
+            }
+            Skin.FX_STARS -> for (i in 0 until 4) {
+                val a = anim * 1.3f + i * 1.57f
+                p.style = Paint.Style.FILL
+                p.color = 0xFFFFFFFF.toInt()
+                c.drawCircle(cx + cos(a) * w * 0.55f, cy + sin(a) * h * 0.2f - h * 0.1f, rad * 0.07f + 0.8f, p)
+            }
+        }
     }
 
     private fun drawParticles(c: Canvas) {
@@ -1451,16 +1125,18 @@ class GameView(context: Context) : View(context) {
 
         // пилы
         for (s in saws) {
-            if (s.y < top - 30f || s.y > bot) continue
+            if (s.dead) continue
+            if (max(s.y0, s.y1) < top - 30f || min(s.y0, s.y1) > bot) continue
+            s.posAt(runTime, sawPos)
             // рельса
-            if (s.x1 > s.x0 || s.y1 > s.y0) {
+            if (s.len > 1f && s.speed != 0f) {
                 p.color = 0x33FFFFFF
                 p.style = Paint.Style.STROKE
                 p.strokeWidth = 3f
                 c.drawLine(s.x0, s.y0, s.x1, s.y1, p)
                 p.style = Paint.Style.FILL
             }
-            drawSaw(c, s.x, s.y, s.ang)
+            drawSaw(c, sawPos[0], sawPos[1], runTime * 9f + s.phase)
         }
         for (o in orbits) {
             if (o.cy < top - 90f || o.cy > bot + 90f) continue
@@ -1468,7 +1144,7 @@ class GameView(context: Context) : View(context) {
             c.drawCircle(o.cx, o.cy, 7f, p)
             for (i in 0 until o.n) {
                 if (!o.alive[i]) continue
-                val a = o.a + i * 2f * PI.toFloat() / o.n
+                val a = o.angle(runTime, i)
                 val sx = o.cx + cos(a) * o.rad
                 val sy = o.cy + sin(a) * o.rad
                 p.style = Paint.Style.STROKE
@@ -1476,7 +1152,7 @@ class GameView(context: Context) : View(context) {
                 p.color = 0x55CFD8DC
                 c.drawLine(o.cx, o.cy, sx, sy, p)
                 p.style = Paint.Style.FILL
-                drawSaw(c, sx, sy, anim * 9f + i)
+                drawSaw(c, sx, sy, runTime * 9f + i)
             }
         }
 
@@ -1509,6 +1185,8 @@ class GameView(context: Context) : View(context) {
             particles.add(Particle(rnd.nextFloat() * W, lavaY, (rnd.nextFloat() - 0.5f) * 40f, -80f - rnd.nextFloat() * 80f, 0.8f, 0.8f, k(0xFFFFB74D), 2.5f))
         }
 
+        drawBoss(c, top, bot)
+
         // тилкайо
         if (scene == Scene.PLAY && inCannon == null) {
             val rot = if (onWall) side * 10f else (face * pvy / 20f).coerceIn(-25f, 25f)
@@ -1516,7 +1194,7 @@ class GameView(context: Context) : View(context) {
             val sx = 1f + squash * 0.22f - stretch
             val sy = 1f - squash * 0.22f + stretch
             val faceDir = if (onWall) -side else face
-            drawTilcayo(c, px, py, r, faceDir, rot, sx, sy, runLevel)
+            drawTilcayo(c, px, py, r, faceDir, rot, sx, sy, runLevel, runSkin)
             if (shield > 0f && (shield > 0.8f || (anim * 10f).toInt() % 2 == 0)) {
                 p.style = Paint.Style.FILL
                 p.color = 0x3355CCFF
@@ -1526,6 +1204,23 @@ class GameView(context: Context) : View(context) {
                 p.color = 0xCC8FE3FF.toInt()
                 c.drawCircle(px, py, r * 1.45f, p)
                 p.style = Paint.Style.FILL
+            }
+            if (!onWall && jumpsLeft > 0) {
+                // стрелки: куда уйдёт тап (яркая) и свайп назад (тусклая)
+                val fwd = sim.forwardDir()
+                for (dirSign in intArrayOf(fwd, -fwd)) {
+                    val bright = dirSign == fwd
+                    val ax = px + dirSign * (r * 1.7f + (if (bright) 4f else 0f))
+                    val sz = if (bright) 8f else 6f
+                    p.style = Paint.Style.FILL
+                    p.color = if (bright) 0xE6FFEB3B.toInt() else 0x66FFFFFF
+                    path.reset()
+                    path.moveTo(ax + dirSign * sz, py)
+                    path.lineTo(ax - dirSign * sz * 0.6f, py - sz)
+                    path.lineTo(ax - dirSign * sz * 0.6f, py + sz)
+                    path.close()
+                    c.drawPath(path, p)
+                }
             }
             if (!onWall) {
                 // точки доступных прыжков в воздухе
@@ -1543,6 +1238,101 @@ class GameView(context: Context) : View(context) {
             text(c, q.text, q.x, q.y - (1f - q.life) * 40f, q.size, col, maxW = 200f)
         }
         c.restore()
+    }
+
+    private fun drawBoss(c: Canvas, top: Float, bot: Float) {
+        val a = sim.arena
+        val b = sim.boss
+        if (a != null && a.active) {
+            // потолок арены
+            p.style = Paint.Style.FILL
+            p.color = 0x99140A28.toInt()
+            c.drawRect(WALL, a.top - 400f, W - WALL, a.top, p)
+            p.color = k(0xFF7C4DFF)
+            c.drawRect(WALL, a.top - 3f, W - WALL, a.top, p)
+        }
+        if (b == null) return
+        val phase = b.hpMax - b.hp
+        // телеграфы атак
+        if (b.state == Boss.RAIN_TELE && a != null) {
+            val blink = if ((anim * 10f).toInt() % 2 == 0) 0x55FF1744 else 0x33FF1744
+            p.style = Paint.Style.FILL
+            p.color = blink
+            for (i in 0 until 3) {
+                c.drawRect(b.cols[i] - 15f, a.top, b.cols[i] + 15f, a.bottom, p)
+                text(c, "!", b.cols[i], a.top + 40f, 30f, 0xFFFF1744.toInt(), shadow = false)
+            }
+        }
+        if (b.state == Boss.CHARGE_WARN || b.state == Boss.CHARGE_MOVE) {
+            val blink = if ((anim * 12f).toInt() % 2 == 0) 0x66FF1744 else 0x22FF1744
+            p.style = Paint.Style.FILL
+            p.color = blink
+            c.drawRect(WALL, b.y - Boss.R, W - WALL, b.y + Boss.R, p)
+            text(c, if (b.dir > 0) "▶▶▶" else "◀◀◀", W / 2, b.y + 10f, 32f, 0xFFFF1744.toInt(), shadow = false)
+        }
+        // снаряды
+        for (h in sim.hairs) {
+            if (h.kind == 0) {
+                p.style = Paint.Style.FILL
+                p.color = k(0xFF9E9E9E)
+                c.drawCircle(h.x, h.y, 9f, p)
+                p.color = k(0xFFCFD8DC)
+                c.drawCircle(h.x - 2f, h.y - 2f, 6f, p)
+                p.style = Paint.Style.STROKE
+                p.strokeWidth = 1.5f
+                p.color = k(0xFF757575)
+                for (j in 0 until 5) {
+                    val ang = anim * 6f + j * 1.2566f
+                    c.drawLine(h.x, h.y, h.x + cos(ang) * 12f, h.y + sin(ang) * 12f, p)
+                }
+                p.style = Paint.Style.FILL
+            } else {
+                text(c, "🥕", h.x, h.y + 8f, 22f, shadow = false)
+            }
+        }
+        // сам Толстый Котозаяц
+        var sx = 1f + 0.03f * sin(anim * 2.4f)
+        var sy = 1f - 0.03f * sin(anim * 2.4f)
+        var rot = 0f
+        var alpha = 255
+        when (b.state) {
+            Boss.VOLLEY_TELE, Boss.RAIN_TELE -> { val k2 = 0.1f * sin(b.t * 30f).coerceIn(-1f, 1f); sx = 1.12f + k2; sy = 1.12f - k2 }
+            Boss.CHARGE_WARN -> rot = sin(b.t * 50f) * 5f
+            Boss.CHARGE_GO -> rot = b.dir * 12f
+            Boss.STUN -> rot = sin(anim * 18f) * 9f
+            Boss.DEAD -> { rot = b.t * 400f; alpha = (255 * (1f - b.t / 2.2f)).toInt().coerceIn(0, 255) }
+        }
+        val w = Boss.R * 2.75f
+        val h = w * bossSprite.height / bossSprite.width
+        c.save()
+        c.translate(b.x, b.y - 4f)
+        c.rotate(rot)
+        c.scale(sx, sy)
+        rect.set(-w / 2, -h / 2, w / 2, h / 2)
+        bmpPaint.alpha = alpha
+        if (b.flash > 0f) {
+            val f = b.flash / 0.5f * 160f
+            bmpPaint.colorFilter = ColorMatrixColorFilter(ColorMatrix(floatArrayOf(1f, 0f, 0f, 0f, f, 0f, 1f, 0f, 0f, f, 0f, 0f, 1f, 0f, f, 0f, 0f, 0f, 1f, 0f)))
+        } else if (b.state == Boss.VOLLEY_TELE || b.state == Boss.RAIN_TELE || b.state == Boss.CHARGE_WARN) {
+            bmpPaint.colorFilter = ColorMatrixColorFilter(ColorMatrix(floatArrayOf(1.15f, 0f, 0f, 0f, 20f, 0f, 0.85f, 0f, 0f, 0f, 0f, 0f, 0.85f, 0f, 0f, 0f, 0f, 0f, 1f, 0f)))
+        }
+        c.drawBitmap(bossSprite, null, rect, bmpPaint)
+        bmpPaint.colorFilter = null
+        bmpPaint.alpha = 255
+        // злые брови во время атаки, обиженные глазки в стане
+        val eyeY = -h * 0.21f
+        val angry = b.state != Boss.HOVER && b.state != Boss.ENTER && b.state != Boss.STUN && b.state != Boss.DEAD
+        if (angry) {
+            p.style = Paint.Style.STROKE
+            p.strokeWidth = 5f
+            p.color = k(0xFF3E1A1A)
+            c.drawLine(-w * 0.26f, eyeY - 16f, -w * 0.07f, eyeY - 6f, p)
+            c.drawLine(w * 0.26f, eyeY - 16f, w * 0.07f, eyeY - 6f, p)
+            p.style = Paint.Style.FILL
+        }
+        c.restore()
+        if (b.state == Boss.STUN) text(c, "💫", b.x, b.y - h * 0.55f, 26f, shadow = false)
+        if (phase >= 2 && b.state != Boss.DEAD) text(c, "💢", b.x + w * 0.38f, b.y - h * 0.38f, 20f, shadow = false)
     }
 
     private fun drawSaw(c: Canvas, x: Float, y: Float, ang: Float) {
@@ -1577,6 +1367,27 @@ class GameView(context: Context) : View(context) {
         text(c, "💰 ${runCoins.toInt()}", 20f, 58f, 19f, 0xFFFFE082.toInt(), Paint.Align.LEFT, maxW = 84f)
         if (coinMul > 1f) text(c, "x${fmt(coinMul)}", 12f, 82f, 12f, 0xAAFFFFFF.toInt(), Paint.Align.LEFT)
         if (combo >= 3) text(c, "комбо x$combo", 12f, 100f, 13f, 0xFFFFD54F.toInt(), Paint.Align.LEFT)
+        // босс: полоска здоровья, баннер, подсказка
+        val bs = sim.boss
+        if (bs != null && bs.state != Boss.DEAD) {
+            panel(c, 40f, 94f, 280f, 34f, 0x99000000.toInt(), 17f)
+            text(c, "ТОЛСТЫЙ КОТОЗАЯЦ", W / 2, 111f, 12f, 0xFFFFF3C4.toInt(), maxW = 250f)
+            val segW = 250f / bs.hpMax
+            for (i in 0 until bs.hpMax) {
+                p.style = Paint.Style.FILL
+                p.color = if (i < bs.hp) k(0xFFFF5470) else 0x44FFFFFF
+                c.drawRoundRect(55f + i * segW + 2f, 117f, 55f + (i + 1) * segW - 2f, 123f, 3f, 3f, p)
+            }
+        }
+        if (bossBanner > 0f) {
+            val ba = min(1f, bossBanner).coerceIn(0f, 1f)
+            val col = ((ba * 255).toInt() shl 24) or 0xFFFF1744.toInt().and(0xFFFFFF)
+            text(c, "⚠ БОСС ⚠", W / 2, viewH * 0.36f, 40f, col, maxW = 330f)
+            text(c, "ТОЛСТЫЙ КОТОЗАЯЦ", W / 2, viewH * 0.36f + 34f, 24f, ((ba * 255).toInt() shl 24) or 0xFFFFFF, maxW = 330f)
+        } else if (bossHint > 0f && bs != null) {
+            val ha = min(1f, bossHint).coerceIn(0f, 1f)
+            text(c, "ПРЫГАЙ ЕМУ НА ГОЛОВУ СВЕРХУ!", W / 2, viewH * 0.8f, 16f, ((ha * 255).toInt() shl 24) or 0xFFFFFF, maxW = 330f)
+        }
         // кнопка паузы
         panel(c, W - 48f, 14f, 36f, 36f, 0x77000000, 18f)
         p.style = Paint.Style.FILL
@@ -1585,11 +1396,12 @@ class GameView(context: Context) : View(context) {
         c.drawRoundRect(W - 27f, 24f, W - 22f, 40f, 2f, 2f, p)
         if (inCannon != null && (anim * 4f).toInt() % 2 == 0) {
             text(c, "ТАП — ВЫСТРЕЛ!", W / 2, viewH * 0.3f, 24f, 0xFFFFC107.toInt(), maxW = 300f)
-        } else if (runTime < 5f && inCannon == null) {
-            val a = (1f - runTime / 5f).coerceIn(0f, 1f)
+        } else if (runTime < 7f && inCannon == null && sim.boss == null) {
+            val a = (1f - runTime / 7f).coerceIn(0f, 1f)
             val col = ((a * 255).toInt() shl 24) or 0xFFFFFF
-            text(c, "ТАП — прыжок на другую стену", W / 2, viewH * 0.80f, 17f, col, maxW = 320f)
-            text(c, "в воздухе ещё 2 прыжка: тап слева / справа", W / 2, viewH * 0.80f + 22f, 14f, col, maxW = 320f)
+            text(c, "ТАП — прыжок на другую стену", W / 2, viewH * 0.78f, 17f, col, maxW = 320f)
+            text(c, "в воздухе ещё 2 рывка:", W / 2, viewH * 0.78f + 24f, 14f, col, maxW = 320f)
+            text(c, "ТАП — вперёд  ·  СВАЙП ← → — в сторону", W / 2, viewH * 0.78f + 44f, 14f, col, maxW = 320f)
         }
         c.restore()
     }
@@ -1600,7 +1412,9 @@ class GameView(context: Context) : View(context) {
         c.scale(ui, ui)
         p.color = 0xAA000000.toInt()
         c.drawRect(-uiOx / ui, -uiOy / ui, 360f + uiOx / ui, 800f + uiOy / ui, p)
-        text(c, "ПАУЗА", 180f, 250f, 48f)
+        text(c, "ПАУЗА", 180f, 230f, 48f)
+        text(c, "ТАП — прыжок со стены, в воздухе — рывок вперёд", 180f, 262f, 12f, 0xCCFFFFFF.toInt(), maxW = 330f)
+        text(c, "СВАЙП ← → в воздухе — рывок в сторону (хоть назад)", 180f, 280f, 12f, 0xCCFFFFFF.toInt(), maxW = 330f)
         btn(c, "▶  ПРОДОЛЖИТЬ", 50f, 300f, 260f, 64f, k(0xFF00C853)) { paused = false }
         btn(c, if (save.sound) "🔊  ЗВУК: ВКЛ" else "🔇  ЗВУК: ВЫКЛ", 50f, 382f, 260f, 52f, k(0xFF5C6BC0)) { toggleSound() }
         btn(c, "🏠  В МЕНЮ", 50f, 452f, 260f, 52f, k(0xFF7C4DFF)) { goMenu() }
@@ -1651,11 +1465,11 @@ class GameView(context: Context) : View(context) {
 
         val lvl = save.level(save.selected)
         val bob = sin(anim * 2.5f)
-        drawTilcayo(c, 180f, 380f + bob * 8f, 40f + lvl * 3f, 1, bob * 4f, 1f + bob * 0.03f, 1f - bob * 0.03f, lvl)
+        drawTilcayo(c, 180f, 380f + bob * 8f, 40f + lvl * 3f, 1, bob * 4f, 1f + bob * 0.03f, 1f - bob * 0.03f, lvl, save.skinOf(save.selected))
         text(c, Balance.names[save.selected % Balance.names.size] + " · ур. $lvl", 180f, 470f, 20f, 0xFFFFF3C4.toInt())
 
         btn(c, "▶  ИГРАТЬ", 50f, 520f, 260f, 80f, k(0xFF00C853)) { startRun() }
-        btn(c, "🐾  ФЕРМА", 50f, 618f, 260f, 64f, k(0xFF7C4DFF), sub = if (save.pending() > 0) "ждёт +${save.pending()} 💰" else null) { goFarm() }
+        btn(c, "🐾  ФЕРМА", 50f, 618f, 260f, 64f, k(0xFF7C4DFF), sub = if (save.pending() > 0) "ждёт +${save.pending()} 💰" else if (save.freeBoxes > 0) "🎁 ждёт бесплатный бокс" else null) { goFarm() }
         btn(c, if (save.sound) "🔊" else "🔇", 150f, 706f, 60f, 48f, k(0xFF5C6BC0)) { toggleSound() }
 
         panel(c, 20f, 20f, 120f, 34f, 0x66000000)
@@ -1674,16 +1488,19 @@ class GameView(context: Context) : View(context) {
     private fun petRadius(i: Int, pet: Pet) = (14f + save.level(i) * 2.4f) * depthScale(pet.y)
 
     private fun syncPets() {
+        // при первом заходе расставляем всех по лугу, а новорождённый появляется рядом с родителем
+        val initial = pets.isEmpty()
         while (pets.size < save.herd.size) {
-            val parent = pets.getOrNull(save.selected)
+            val parent = if (initial) null else pets.getOrNull(save.selected)
             val pet = Pet(
-                (parent?.x ?: (GX0 + rnd.nextFloat() * (GX1 - GX0))) + (rnd.nextFloat() - 0.5f) * 30f,
-                (parent?.y ?: (GY0 + rnd.nextFloat() * (GY1 - GY0))) + (rnd.nextFloat() - 0.5f) * 20f,
+                (parent?.x ?: (GX0 + rnd.nextFloat() * (GX1 - GX0))) + (if (parent != null) (rnd.nextFloat() - 0.5f) * 30f else 0f),
+                (parent?.y ?: (GY0 + rnd.nextFloat() * (GY1 - GY0))) + (if (parent != null) (rnd.nextFloat() - 0.5f) * 20f else 0f),
             )
             pet.x = pet.x.coerceIn(GX0, GX1)
             pet.y = pet.y.coerceIn(GY0, GY1)
+            pet.face = if (rnd.nextBoolean()) 1 else -1
             pets.add(pet)
-            hop(pet, 2)
+            if (!initial) hop(pet, 2)
         }
         while (pets.size > save.herd.size) pets.removeAt(pets.size - 1)
     }
@@ -1724,9 +1541,7 @@ class GameView(context: Context) : View(context) {
 
     private fun updatePets(dt: Float) {
         // еда падает
-        val fi = farmFoods.iterator()
-        while (fi.hasNext()) {
-            val f = fi.next()
+        for (f in farmFoods) {
             if (f.z > 0f || f.vz > 0f) {
                 f.vz -= 800f * dt
                 f.z += f.vz * dt
@@ -1735,11 +1550,16 @@ class GameView(context: Context) : View(context) {
         }
         for ((i, pet) in pets.withIndex()) {
             val sp = max(18f, 56f - save.level(i) * 3.5f)
+            pet.squash = max(0f, pet.squash - dt * 4f)
             when (pet.st) {
                 Pet.IDLE -> {
-                    pet.t -= dt
-                    if (pet.t <= 0f) pickNext(pet)
-                    if (farmFoods.any { it.owner === pet }) pickNext(pet)
+                    if (pet.dizzy > 0f) {
+                        pet.dizzy -= dt
+                    } else {
+                        pet.t -= dt
+                        if (pet.t <= 0f) pickNext(pet)
+                        if (farmFoods.any { it.owner === pet }) pickNext(pet)
+                    }
                 }
                 Pet.WALK -> {
                     val food = farmFoods.filter { it.owner === pet }.minByOrNull { hypot(it.x - pet.x, it.y - pet.y) }
@@ -1786,58 +1606,195 @@ class GameView(context: Context) : View(context) {
                     pet.t -= dt
                     if (pet.t <= 0f) { pet.st = Pet.IDLE; pet.t = 0.3f }
                 }
+                Pet.DRAG -> {
+                    // позицию задаёт палец; крен — по скорости движения
+                    pet.spin += (pet.gvx * 0.04f - pet.spin) * min(1f, dt * 8f)
+                }
+                Pet.FLY -> {
+                    pet.vz -= 700f * dt
+                    pet.z += pet.vz * dt
+                    pet.x += pet.gvx * dt
+                    pet.y += pet.gvy * dt
+                    pet.spin += pet.spinV * dt
+                    // отскок от забора и краёв луга
+                    if (pet.x < GX0) { pet.x = GX0; pet.gvx = abs(pet.gvx) * 0.6f; pet.spinV *= -0.6f }
+                    if (pet.x > GX1) { pet.x = GX1; pet.gvx = -abs(pet.gvx) * 0.6f; pet.spinV *= -0.6f }
+                    if (pet.y < GY0) { pet.y = GY0; pet.gvy = abs(pet.gvy) * 0.5f }
+                    if (pet.y > GY1) { pet.y = GY1; pet.gvy = -abs(pet.gvy) * 0.5f }
+                    if (abs(pet.gvx) > 6f) pet.face = if (pet.gvx > 0f) 1 else -1
+                    if (pet.z <= 0f) {
+                        pet.z = 0f
+                        if (pet.vz < -110f) {
+                            pet.vz = -pet.vz * 0.42f
+                            pet.gvx *= 0.7f
+                            pet.gvy *= 0.7f
+                            pet.spinV *= 0.55f
+                            pet.squash = 1f
+                            sfx.play(Sfx.S.LAND, 0.8f + rnd.nextFloat() * 0.3f, 0.8f)
+                        } else {
+                            pet.vz = 0f
+                            val fr = max(0f, 1f - 5f * dt)
+                            pet.gvx *= fr
+                            pet.gvy *= fr
+                            pet.spinV *= fr
+                            pet.spin += (0f - pet.spin) * min(1f, dt * 8f)
+                            if (hypot(pet.gvx, pet.gvy) < 14f) {
+                                pet.st = Pet.IDLE
+                                pet.t = 0.6f
+                                pet.spin = 0f
+                                pet.spinV = 0f
+                                pet.gvx = 0f
+                                pet.gvy = 0f
+                            }
+                        }
+                    }
+                }
             }
-            pet.x = pet.x.coerceIn(GX0, GX1)
+            pet.x = pet.x.coerceIn(GX0 - 12f, GX1 + 12f)
             pet.y = pet.y.coerceIn(GY0, GY1)
         }
     }
 
-    private fun onFarmTap(ux: Float, uy: Float) {
-        if (uy < 250f || uy > 515f) return
-        // верхний (ближайший к зрителю) тилкайо под пальцем
+    /** Какой тилкайо под пальцем (самый «передний»), либо -1. */
+    private fun petAt(ux: Float, uy: Float): Int {
         var best = -1
         var bestY = -1f
         for ((i, pet) in pets.withIndex()) {
             val rad = petRadius(i, pet)
             val cy = pet.y - rad * 1.1f - pet.z
-            if (abs(ux - pet.x) < rad * 1.2f && uy > cy - rad * 1.2f && uy < pet.y + 6f && pet.y > bestY) {
+            if (abs(ux - pet.x) < rad * 1.25f && uy > cy - rad * 1.25f && uy < cy + rad * 1.2f && pet.y > bestY) {
                 best = i
                 bestY = pet.y
             }
         }
-        if (best >= 0) {
-            save.selected = best
+        return best
+    }
+
+    private fun farmDown(ux: Float, uy: Float, id: Int) {
+        if (viewFarm >= save.unlocked) return
+        val i = petAt(ux, uy)
+        if (i < 0) return
+        dragPtr = id
+        dragIdx = i
+        dragMoved = false
+        dragX0 = ux
+        dragY0 = uy
+        histN = 0
+    }
+
+    private fun pushHist(ux: Float, uy: Float) {
+        val tms = (System.nanoTime() / 1_000_000L).toFloat()
+        if (histN == 6) {
+            for (j in 0 until 15) hist[j] = hist[j + 3]
+            histN = 5
+        }
+        hist[histN * 3] = ux; hist[histN * 3 + 1] = uy; hist[histN * 3 + 2] = tms
+        histN++
+    }
+
+    private fun farmMove(ux: Float, uy: Float) {
+        if (dragIdx < 0 || dragIdx >= pets.size) return
+        val pet = pets[dragIdx]
+        if (!dragMoved && hypot(ux - dragX0, uy - dragY0) > 10f) {
+            dragMoved = true
+            pet.st = Pet.DRAG
+            pet.vz = 0f
+            pet.spin = 0f
+            pet.spinV = 0f
+            save.selected = dragIdx
             save.save()
-            val pet = pets[best]
+            sfx.play(Sfx.S.HOP, 1.4f, 0.6f)
+        }
+        if (!dragMoved) return
+        val rad = petRadius(dragIdx, pet)
+        val gy = (uy + rad * 1.1f + 24f).coerceIn(GY0, GY1)
+        pet.gvx = (ux - pet.x) * 3f
+        pet.x = ux.coerceIn(GX0 - 12f, GX1 + 12f)
+        pet.y = gy
+        pet.z = max(24f, gy - rad * 1.1f - uy)
+        if (abs(pet.gvx) > 20f) pet.face = if (pet.gvx > 0f) 1 else -1
+        pushHist(ux, uy)
+    }
+
+    private fun farmUp() {
+        val idx = dragIdx
+        dragPtr = -1
+        dragIdx = -1
+        if (idx < 0 || idx >= pets.size) return
+        val pet = pets[idx]
+        if (!dragMoved) {
+            // обычный тап: выбрать и подпрыгнуть
+            save.selected = idx
+            save.save()
             if (pet.st != Pet.HOP && pet.st != Pet.FLIP) { if (rnd.nextInt(3) == 0) flip(pet) else hop(pet, 2) }
             sfx.play(Sfx.S.HOP, 1.1f, 0.6f)
-            uiPops.add(Pop(pet.x, pet.y - petRadius(best, pet) * 2.4f, "💛", 0xFFFFFFFF.toInt(), 22f))
+            uiPops.add(Pop(pet.x, pet.y - petRadius(idx, pet) * 2.4f, "💛", 0xFFFFFFFF.toInt(), 22f))
+            return
+        }
+        // бросок: скорость пальца за последние ~100 мс
+        var vx = 0f
+        var vy = 0f
+        if (histN >= 2) {
+            val tNow = hist[(histN - 1) * 3 + 2]
+            var j = histN - 2
+            while (j > 0 && tNow - hist[j * 3 + 2] < 100f) j--
+            val dtMs = tNow - hist[j * 3 + 2]
+            if (dtMs > 15f && (System.nanoTime() / 1_000_000L).toFloat() - tNow < 120f) {
+                vx = (hist[(histN - 1) * 3] - hist[j * 3]) / dtMs * 1000f
+                vy = (hist[(histN - 1) * 3 + 1] - hist[j * 3 + 1]) / dtMs * 1000f
+            }
+        }
+        val speed = hypot(vx, vy)
+        pet.st = Pet.FLY
+        if (speed < 60f) {
+            pet.gvx = 0f; pet.gvy = 0f; pet.vz = 0f; pet.spinV = 0f
+        } else {
+            pet.gvx = (vx * 0.85f).coerceIn(-650f, 650f)
+            pet.gvy = (vy * 0.4f).coerceIn(-260f, 260f)
+            pet.vz = (-vy * 0.7f + 30f).coerceIn(-200f, 620f)
+            pet.spinV = (vx * 0.9f).coerceIn(-900f, 900f)
+            if (speed > 700f) pet.dizzy = 1.6f
+            sfx.play(Sfx.S.THROW, 0.8f + min(0.8f, speed / 1200f), 0.6f)
         }
     }
 
-    private fun drawFarm(c: Canvas, dt: Float) {
-        syncPets()
-        updatePets(dt)
-        stepFx(dt)
-        drawBackground(c, k(0xFF4FB3F6), k(0xFFD9F3FF), 0f, withStars = false)
-        c.save()
-        c.translate(uiOx, uiOy)
-        c.scale(ui, ui)
-        val ox = -uiOx / ui - 4f
-        val ow = 368f + 2 * uiOx / ui
+    private fun goWardrobe() {
+        scene = Scene.WARDROBE
+        sceneTime = 0f
+        boxStage = 0
+    }
 
-        // солнце и облака
+    private fun selectFarm(i: Int) {
+        viewFarm = i
+        if (i < save.unlocked && save.activeFarm != i) {
+            save.activeFarm = i
+            save.save()
+            farmFoods.clear()
+            dragIdx = -1
+            dragPtr = -1
+        }
+    }
+
+    // ---------- рисование фермы ----------
+
+    private fun drawFarmScenery(c: Canvas, th: FarmTheme, ox: Float, ow: Float) {
         p.style = Paint.Style.FILL
-        p.color = 0x55FFF59D
-        c.drawCircle(300f, 165f, 44f, p)
-        p.color = k(0xFFFFEB3B)
-        c.drawCircle(300f, 165f, 30f, p)
-        for (i in 0 until 3) {
-            val cx = ((anim * (6f + i * 3f) + i * 140f) % 480f) - 60f
-            val cy = 150f + i * 26f
-            p.color = 0xCCFFFFFF.toInt()
-            c.drawCircle(cx, cy, 15f, p); c.drawCircle(cx + 16f, cy - 8f, 19f, p)
-            c.drawCircle(cx + 36f, cy, 15f, p); c.drawRect(cx, cy, cx + 36f, cy + 15f, p)
+        // солнце / Земля
+        when (th.sun) {
+            0 -> { p.color = 0x55FFF59D; c.drawCircle(300f, 165f, 44f, p); p.color = k(0xFFFFEB3B); c.drawCircle(300f, 165f, 30f, p) }
+            1 -> { p.color = 0x55FFB74D; c.drawCircle(290f, 175f, 56f, p); p.color = k(0xFFFF9800); c.drawCircle(290f, 175f, 38f, p) }
+            2 -> { p.color = 0x44FFFFFF; c.drawCircle(300f, 165f, 40f, p); p.color = k(0xFFFFF8E1); c.drawCircle(300f, 165f, 26f, p) }
+            else -> text(c, "🌍", 296f, 190f, 70f, shadow = false)
+        }
+        // облака
+        if (!th.stars) {
+            for (i in 0 until 3) {
+                val cx = ((anim * (6f + i * 3f) + i * 140f) % 480f) - 60f
+                val cy = 150f + i * 26f
+                p.color = if (th.sun == 1) 0xAAFFF3E0.toInt() else 0xCCFFFFFF.toInt()
+                c.drawCircle(cx, cy, 15f, p); c.drawCircle(cx + 16f, cy - 8f, 19f, p)
+                c.drawCircle(cx + 36f, cy, 15f, p); c.drawRect(cx, cy, cx + 36f, cy + 15f, p)
+            }
         }
         // холмы
         for (layer in 0..1) {
@@ -1851,14 +1808,14 @@ class GameView(context: Context) : View(context) {
             }
             path.lineTo(ox + ow, 320f)
             path.close()
-            p.color = if (layer == 0) k(0xFF8BD17F) else k(0xFF6CC067)
+            p.color = if (layer == 0) th.hillA else th.hillB
             c.drawPath(path, p)
         }
-        text(c, "🌳", 28f, 258f, 56f, shadow = false)
-        text(c, "🌳", 334f, 254f, 48f, shadow = false)
+        text(c, th.props, 28f, 258f, 56f, shadow = false)
+        text(c, th.props, 334f, 254f, 48f, shadow = false)
 
         // луг с полосами
-        p.color = k(0xFF5DBB57)
+        p.color = th.ground
         c.drawRect(ox, 252f, ox + ow, 515f, p)
         var by = 252f
         var bhh = 12f
@@ -1870,69 +1827,110 @@ class GameView(context: Context) : View(context) {
         // забор
         var fx = ox
         while (fx < ox + ow) {
-            p.color = k(0xFFD9A760)
+            p.color = th.fence
             c.drawRoundRect(fx, 246f, fx + 8f, 276f, 3f, 3f, p)
-            p.color = k(0xFFB98544)
+            p.color = th.fenceDark
             c.drawRect(fx + 5f, 248f, fx + 8f, 276f, p)
             fx += 38f
         }
-        p.color = k(0xFFE8BC78)
+        p.color = th.fence
         c.drawRect(ox, 254f, ox + ow, 260f, p)
         c.drawRect(ox, 266f, ox + ow, 272f, p)
-        // цветочки
-        for (d in decor) text(c, d.third, d.first, d.second, 13f, shadow = false)
+        // украшения
+        for (d in decor) text(c, th.decor[d.third % th.decor.size], d.first, d.second, 13f, shadow = false)
+    }
 
-        // еда на земле
-        for (f in farmFoods) {
-            p.color = 0x33000000
-            rect.set(f.x - 9f, f.y - 3f, f.x + 9f, f.y + 3f)
-            c.drawOval(rect, p)
-            text(c, f.emoji, f.x, f.y - 4f - f.z, 20f, shadow = false)
+    private fun drawFarm(c: Canvas, dt: Float) {
+        val ti = viewFarm.coerceIn(0, Farms.COUNT - 1)
+        val th = Farms.all[ti]
+        val locked = ti >= save.unlocked
+        if (!locked) {
+            if (save.activeFarm != ti) selectFarm(ti)
+            syncPets()
+            updatePets(dt)
         }
+        stepFx(dt)
+        drawBackground(c, th.skyTop, th.skyBot, 0f, withStars = th.stars)
+        c.save()
+        c.translate(uiOx, uiOy)
+        c.scale(ui, ui)
+        val ox = -uiOx / ui - 4f
+        val ow = 368f + 2 * uiOx / ui
 
-        // тилкайо, отсортированные по глубине
-        val order = pets.indices.sortedBy { pets[it].y }
-        for (i in order) {
-            val pet = pets[i]
-            val lvl = save.level(i)
-            val rad = petRadius(i, pet)
-            val sel = i == save.selected
-            // тень
-            val sh = 1f / (1f + pet.z / 90f)
-            p.style = Paint.Style.FILL
-            p.color = ((0x40 * sh).toInt() shl 24)
-            rect.set(pet.x - rad * 1.15f * sh, pet.y - rad * 0.2f, pet.x + rad * 1.15f * sh, pet.y + rad * 0.2f)
-            c.drawOval(rect, p)
-            if (sel) {
-                p.style = Paint.Style.STROKE
-                p.strokeWidth = 2.5f
-                p.color = k(0xFFFFD54F)
-                val pulse = 1f + 0.06f * sin(anim * 5f)
-                rect.set(pet.x - rad * 1.35f * pulse, pet.y - rad * 0.3f * pulse, pet.x + rad * 1.35f * pulse, pet.y + rad * 0.3f * pulse)
+        drawFarmScenery(c, th, ox, ow)
+
+        if (!locked) {
+            // еда на земле
+            for (f in farmFoods) {
+                p.color = 0x33000000
+                rect.set(f.x - 9f, f.y - 3f, f.x + 9f, f.y + 3f)
                 c.drawOval(rect, p)
+                text(c, f.emoji, f.x, f.y - 4f - f.z, 20f, shadow = false)
+            }
+
+            // тилкайо, отсортированные по глубине; несомый — всегда сверху
+            val order = pets.indices.sortedBy { if (pets[it].st == Pet.DRAG) 10000f else pets[it].y }
+            for (i in order) {
+                val pet = pets[i]
+                val lvl = save.level(i)
+                val rad = petRadius(i, pet)
+                val sel = i == save.selected
+                // тень
+                val sh = 1f / (1f + pet.z / 90f)
                 p.style = Paint.Style.FILL
+                p.color = ((0x40 * sh).toInt() shl 24)
+                rect.set(pet.x - rad * 1.15f * sh, pet.y - rad * 0.2f, pet.x + rad * 1.15f * sh, pet.y + rad * 0.2f)
+                c.drawOval(rect, p)
+                if (sel) {
+                    p.style = Paint.Style.STROKE
+                    p.strokeWidth = 2.5f
+                    p.color = k(0xFFFFD54F)
+                    val pulse = 1f + 0.06f * sin(anim * 5f)
+                    rect.set(pet.x - rad * 1.35f * pulse, pet.y - rad * 0.3f * pulse, pet.x + rad * 1.35f * pulse, pet.y + rad * 0.3f * pulse)
+                    c.drawOval(rect, p)
+                    p.style = Paint.Style.FILL
+                }
+                var rot = 0f
+                var sx = 1f + 0.02f * sin(anim * 2f + i)
+                var sy = 1f - 0.02f * sin(anim * 2f + i)
+                var bounce = 0f
+                when (pet.st) {
+                    Pet.WALK -> { rot = sin(pet.ph * 2f * PI.toFloat()) * 6f; bounce = abs(sin(pet.ph * 2f * PI.toFloat())) * 2.5f }
+                    Pet.FLIP -> rot = pet.spin * pet.face
+                    Pet.EAT -> { sy = 1f - 0.08f * abs(sin(pet.t * 20f)); sx = 1f + 0.05f * abs(sin(pet.t * 20f)) }
+                    Pet.HOP -> { val st = (pet.vz / 200f).coerceIn(-0.2f, 0.2f); sx = 1f - st * 0.4f; sy = 1f + st * 0.5f }
+                    Pet.DRAG -> { rot = pet.spin.coerceIn(-25f, 25f); sy = 1.08f; sx = 0.94f }
+                    Pet.FLY -> rot = pet.spin
+                    Pet.IDLE -> if (pet.dizzy > 0f) rot = sin(anim * 14f) * 8f
+                }
+                if (pet.squash > 0f) { sy *= 1f - 0.22f * pet.squash; sx *= 1f + 0.16f * pet.squash }
+                val cy = pet.y - rad * 1.1f - pet.z - bounce
+                drawTilcayo(c, pet.x, cy, rad, pet.face, rot, sx, sy, lvl, save.skinOf(i))
+                if (pet.dizzy > 0f && pet.st != Pet.DRAG) text(c, "💫", pet.x, cy - rad * 1.5f, 20f, shadow = false)
+                if (pet.st == Pet.DRAG) {
+                    text(c, "🤏", pet.x, cy - rad * 1.45f, 16f, shadow = false)
+                } else if (sel) {
+                    text(c, "⭐ ${Balance.names[i % Balance.names.size]} · ур.$lvl", pet.x, cy - rad * 1.55f, 12f, 0xFFFFF3C4.toInt(), maxW = 110f)
+                } else {
+                    text(c, "ур.$lvl", pet.x, cy - rad * 1.25f, 10f, 0xCCFFFFFF.toInt())
+                }
             }
-            var rot = 0f
-            var sx = 1f + 0.02f * sin(anim * 2f + i)
-            var sy = 1f - 0.02f * sin(anim * 2f + i)
-            var bounce = 0f
-            when (pet.st) {
-                Pet.WALK -> { rot = sin(pet.ph * 2f * PI.toFloat()) * 6f; bounce = abs(sin(pet.ph * 2f * PI.toFloat())) * 2.5f }
-                Pet.FLIP -> rot = pet.spin * pet.face
-                Pet.EAT -> { sy = 1f - 0.08f * abs(sin(pet.t * 20f)); sx = 1f + 0.05f * abs(sin(pet.t * 20f)) }
-                Pet.HOP -> { val st = (pet.vz / 200f).coerceIn(-0.2f, 0.2f); sx = 1f - st * 0.4f; sy = 1f + st * 0.5f }
-            }
-            val cy = pet.y - rad * 1.1f - pet.z - bounce
-            drawTilcayo(c, pet.x, cy, rad, pet.face, rot, sx, sy, lvl)
-            if (sel) {
-                text(c, "⭐ ${Balance.names[i % Balance.names.size]} · ур.$lvl", pet.x, cy - rad * 1.55f, 12f, 0xFFFFF3C4.toInt(), maxW = 110f)
-            } else {
-                text(c, "ур.$lvl", pet.x, cy - rad * 1.25f, 10f, 0xCCFFFFFF.toInt())
+            drawParticles(c)
+        }
+
+        // снегопад
+        if (th.snow) {
+            p.style = Paint.Style.FILL
+            p.color = 0xCCFFFFFF.toInt()
+            for ((i, f) in snowflakes.withIndex()) {
+                val y = (f.second + anim * 28f * f.third) % 520f
+                val x = f.first + sin(anim * 1.2f + i) * 8f
+                c.drawCircle(x, y, 1.2f + f.third, p)
             }
         }
-        drawParticles(c)
 
         // нижняя панель
+        p.style = Paint.Style.FILL
         p.color = k(0xFF3B2A1C)
         c.drawRect(ox, 512f, ox + ow, 800f + uiOy / ui + 4f, p)
         p.color = k(0xFF5C4129)
@@ -1940,13 +1938,13 @@ class GameView(context: Context) : View(context) {
 
         // шапка
         btn(c, "◀", 10f, 14f, 52f, 44f, k(0xFF5C6BC0)) { goMenu() }
-        text(c, "ФЕРМА", 180f, 48f, 32f)
+        text(c, "ФЕРМА · ${th.name.uppercase()}", 154f, 48f, 26f, maxW = 176f)
         panel(c, 250f, 18f, 100f, 36f, 0x66000000)
         text(c, "💰 ${save.coins}", 258f, 44f, 20f, 0xFFFFE082.toInt(), Paint.Align.LEFT, maxW = 86f)
 
         // доход
         panel(c, 10f, 70f, 340f, 52f, 0x66000000)
-        text(c, "Доход: ${save.incomePerMin()} 💰/мин", 20f, 93f, 17f, 0xFFFFFFFF.toInt(), Paint.Align.LEFT, maxW = 170f)
+        text(c, "Доход: ${fmt(save.incomePerMin())} 💰/мин", 20f, 93f, 17f, 0xFFFFFFFF.toInt(), Paint.Align.LEFT, maxW = 170f)
         text(c, "монет в забеге: x${fmt(save.coinMultiplier())}", 20f, 112f, 12f, 0xAAFFFFFF.toInt(), Paint.Align.LEFT, maxW = 170f)
         val pend = save.pending()
         btn(c, "СОБРАТЬ", 196f, 76f, 148f, 40f, k(0xFFFFA000), enabled = pend > 0) {
@@ -1956,27 +1954,22 @@ class GameView(context: Context) : View(context) {
         }
         if (pend > 0) text(c, "+$pend", 270f, 70f, 13f, 0xFFFFE082.toInt())
 
-        // выбранный
-        val sel = save.selected
-        val lvl = save.level(sel)
-        val name = Balance.names[sel % Balance.names.size]
-        text(c, "$name — бегун в забеге, ур. $lvl", 180f, 536f, 16f, 0xFFFFFFFF.toInt(), maxW = 340f)
-        text(c, "тапни тилкайо, чтобы выбрать · жирнее = больше монет", 180f, 552f, 11f, 0xAAFFFFFF.toInt(), maxW = 340f)
-
-        // еда
-        for ((i, f) in Balance.foods.withIndex()) {
-            val canBuy = lvl < Balance.MAX_LEVEL && save.coins >= f.cost
-            btn(c, "${f.emoji} +${f.fat}", 8f + i * 118f, 562f, 110f, 56f, k(0xFFEF6C00), sub = "${f.cost} 💰", enabled = canBuy) { feed(f) }
+        // вкладки ферм и гардероб
+        for (i in 0 until Farms.COUNT) {
+            val isLocked = i >= save.unlocked
+            val label = if (isLocked) "🔒" else Farms.all[i].emoji
+            val col = if (i == ti) k(0xFF00C853) else if (isLocked) k(0xFF55556A) else k(0xFF5C6BC0)
+            btn(c, label, 8f + i * 67f, 128f, 62f, 34f, col) { selectFarm(i) }
         }
+        btn(c, "👗 Скины", 278f, 128f, 74f, 34f, k(0xFFE91E63), sub = null) { goWardrobe() }
+        if (save.freeBoxes > 0) text(c, "🎁${save.freeBoxes}", 346f, 128f, 14f, shadow = true)
 
-        // размножение
-        val canBreed = save.herd.size < Balance.MAX_HERD
-        val cost = Balance.breedCost(save.herd.size)
-        val breedLabel = if (canBreed) "💕 РАЗМНОЖИТЬ" else "Ферма переполнена!"
-        btn(c, breedLabel, 8f, 632f, 344f, 62f, k(0xFFE91E63), sub = if (canBreed) "нужен ур.2+ · $cost 💰" else null,
-            enabled = canBreed && lvl >= 2 && save.coins >= cost) { breed() }
-
-        btn(c, "▶  В ЗАБЕГ", 8f, 708f, 344f, 70f, k(0xFF00C853)) { startRun() }
+        if (locked) {
+            drawLockedFarm(c, ti, th)
+            btn(c, "▶  В ЗАБЕГ", 8f, 708f, 344f, 70f, k(0xFF00C853)) { startRun() }
+        } else {
+            drawFarmControls(c)
+        }
 
         // всплывашки
         for (q in uiPops) {
@@ -1989,6 +1982,72 @@ class GameView(context: Context) : View(context) {
             text(c, toastText, 180f, 213f, 17f, ((a * 255).toInt() shl 24) or 0xFFFFFF, maxW = 260f)
         }
         c.restore()
+    }
+
+    private fun drawLockedFarm(c: Canvas, ti: Int, th: FarmTheme) {
+        p.style = Paint.Style.FILL
+        p.color = 0x99000000.toInt()
+        c.drawRect(-200f, 252f, 560f, 512f, p)
+        panel(c, 30f, 290f, 300f, 200f, 0xEE231A3D.toInt(), 22f)
+        text(c, "🔒 ${th.emoji} ${th.name}", 180f, 330f, 26f, maxW = 270f)
+        text(c, "Доход фермы: x${fmt(th.incomeMul)}", 180f, 356f, 15f, 0xFFFFF3C4.toInt())
+        text(c, "Свои тилкайо и свои скины", 180f, 376f, 12f, 0xAAFFFFFF.toInt())
+        if (ti == save.unlocked) {
+            btn(c, "ОТКРЫТЬ ЗА ${th.unlockCost} 💰", 50f, 396f, 260f, 62f, k(0xFFFFA000), enabled = save.coins >= th.unlockCost) {
+                if (save.unlockFarm()) {
+                    viewFarm = save.activeFarm
+                    farmFoods.clear()
+                    sfx.play(Sfx.S.LEVEL)
+                    toast("Ферма «${th.name}» открыта! 🎉")
+                    for (n in 0 until 30) {
+                        val a = rnd.nextFloat() * 2f * PI.toFloat()
+                        val sp = 60f + rnd.nextFloat() * 160f
+                        particles.add(Particle(180f, 380f, cos(a) * sp, sin(a) * sp - 100f, 1f, 1f, blockColors[n % 5], 3f + rnd.nextFloat() * 3f))
+                    }
+                } else toast("Не хватает монет: нужно ${th.unlockCost}")
+            }
+        } else {
+            text(c, "Сначала открой «${Farms.all[save.unlocked].name}»", 180f, 430f, 15f, 0xFFFF8A80.toInt(), maxW = 270f)
+        }
+    }
+
+    private fun drawFarmControls(c: Canvas) {
+        val sel = save.selected
+        val lvl = save.level(sel)
+        val name = Balance.names[sel % Balance.names.size]
+        text(c, "$name — бегун в забеге, ур. $lvl", 180f, 536f, 16f, 0xFFFFFFFF.toInt(), maxW = 340f)
+        val cur = save.herd[sel]
+        val info = if (lvl < Balance.MAX_LEVEL) "жир $cur / ${Balance.fatFor(lvl + 1)} до ур.${lvl + 1} · тапни — выбрать, потяни — кинуть"
+        else "максимальный уровень 👑 · тапни — выбрать, потяни — кинуть"
+        text(c, info, 180f, 552f, 11f, 0xAAFFFFFF.toInt(), maxW = 340f)
+
+        // еда
+        for ((i, f) in Balance.foods.withIndex()) {
+            val canBuy = lvl < Balance.MAX_LEVEL && save.coins >= f.cost
+            btn(c, "${f.emoji} +${f.fat}", 8f + i * 118f, 562f, 110f, 56f, k(0xFFEF6C00), sub = "${f.cost} 💰", enabled = canBuy) { feed(f) }
+        }
+
+        // размножение
+        val n = save.herd.size
+        val canBreed = n < Balance.MAX_HERD
+        val req = Balance.breedLevel(n)
+        val cost = Balance.breedCost(n)
+        val preg = save.pregnant()
+        val left = save.breedLeftMs() / 1000
+        val breedLabel = when {
+            preg -> "🍼 Роды через %d:%02d".format(left / 60, left % 60)
+            !canBreed -> "Ферма переполнена!"
+            else -> "💕 РАЗМНОЖИТЬ"
+        }
+        val breedSub = when {
+            preg -> "малыш вынашивается…"
+            !canBreed -> null
+            else -> "нужен ур.$req+ · $cost 💰 · ${Balance.breedMs(n) / 60000} мин"
+        }
+        btn(c, breedLabel, 8f, 632f, 344f, 62f, k(0xFFE91E63), sub = breedSub,
+            enabled = !preg && canBreed && lvl >= req && save.coins >= cost) { breed() }
+
+        btn(c, "▶  В ЗАБЕГ", 8f, 708f, 344f, 70f, k(0xFF00C853)) { startRun() }
     }
 
     private fun feed(f: FoodItem) {
@@ -2026,15 +2085,199 @@ class GameView(context: Context) : View(context) {
     private fun breed() {
         val n = save.herd.size
         val cost = Balance.breedCost(n)
+        val req = Balance.breedLevel(n)
+        if (save.pregnant()) return toast("Малыш ещё вынашивается…")
         if (n >= Balance.MAX_HERD) return toast("Ферма переполнена")
-        if (save.level(save.selected) < 2) return toast("Сначала откорми до ур.2")
-        if (save.coins < cost) return toast("Не хватает монет")
+        if (save.level(save.selected) < req) return toast("Нужен выбранный тилкайо ур.$req+")
+        if (save.coins < cost) return toast("Не хватает монет: нужно $cost")
         save.coins -= cost
-        save.herd.add(0)
+        save.breedEnd = System.currentTimeMillis() + Balance.breedMs(n)
         save.save()
-        sfx.play(Sfx.S.BREED)
-        toast("Родился ${Balance.names[n % Balance.names.size]}! 🍼")
+        sfx.play(Sfx.S.BUY)
+        toast("Малыш родится через ${Balance.breedMs(n) / 60000} мин 💕")
         val par = pets.getOrNull(save.selected)
-        if (par != null) uiPops.add(Pop(par.x, par.y - 70f, "💕 +1 тилкайо!", 0xFFF48FB1.toInt(), 26f))
+        if (par != null) uiPops.add(Pop(par.x, par.y - 70f, "💕", 0xFFF48FB1.toInt(), 30f))
+    }
+
+    // =====================================================================
+    // Гардероб: боксы со скинами и примерочная
+    // =====================================================================
+
+    private fun buyBox(kind: Int, free: Boolean) {
+        if (boxStage != 0) return
+        val bt = Boxes.all[kind]
+        if (free) {
+            if (save.freeBoxes <= 0) return
+            save.freeBoxes--
+        } else {
+            if (save.coins < bt.price) return toast("Не хватает монет: нужно ${bt.price}")
+            save.coins -= bt.price
+        }
+        boxKind = kind
+        boxFree = free
+        boxSkin = Boxes.roll(bt, rnd)
+        boxDup = save.giveSkin(boxSkin)
+        save.save()
+        boxStage = 1
+        boxT = 0f
+        sfx.play(Sfx.S.BOX)
+    }
+
+    private fun drawWardrobe(c: Canvas, dt: Float) {
+        stepFx(dt)
+        drawBackground(c, k(0xFF2A1055), k(0xFF7B2FA0), anim * 20f)
+        c.save()
+        c.translate(uiOx, uiOy)
+        c.scale(ui, ui)
+
+        btn(c, "◀", 10f, 14f, 52f, 44f, k(0xFF5C6BC0)) { if (boxStage == 0) goFarm() }
+        text(c, "ГАРДЕРОБ", 154f, 48f, 30f, maxW = 176f)
+        panel(c, 250f, 18f, 100f, 36f, 0x66000000)
+        text(c, "💰 ${save.coins}", 258f, 44f, 20f, 0xFFFFE082.toInt(), Paint.Align.LEFT, maxW = 86f)
+
+        // боксы
+        for ((i, bt) in Boxes.all.withIndex()) {
+            val x = 8f + i * 118f
+            val y = 68f
+            panel(c, x, y, 110f, 146f, 0x55000000)
+            val wob = sin(anim * 3f + i) * 4f
+            c.save()
+            c.translate(x + 55f, y + 46f)
+            c.rotate(wob)
+            text(c, bt.emoji, 0f, 14f, 46f, shadow = false)
+            c.restore()
+            text(c, bt.name, x + 55f, y + 70f, 12f, maxW = 100f)
+            text(c, "Ред ${bt.odds[1]}% · Эп ${bt.odds[2]}%", x + 55f, y + 83f, 9f, 0xCCFFFFFF.toInt(), maxW = 100f)
+            text(c, "Легенд. ${bt.odds[3]}%", x + 55f, y + 94f, 9f, 0xFFFFD54F.toInt(), maxW = 100f)
+            if (i == 0 && save.freeBoxes > 0) {
+                btn(c, "🎁 БЕСПЛАТНО", x + 6f, y + 102f, 98f, 38f, k(0xFF00C853), sub = "осталось ${save.freeBoxes}") { buyBox(0, true) }
+            } else {
+                btn(c, "${bt.price} 💰", x + 6f, y + 102f, 98f, 38f, k(0xFFFFA000), enabled = save.coins >= bt.price) { buyBox(i, false) }
+            }
+        }
+
+        // сетка скинов
+        val sel = save.selected
+        val wearing = save.skinOf(sel)
+        text(c, "Надеть на: ${Balance.names[sel % Balance.names.size]} (ур.${save.level(sel)})", 180f, 238f, 15f, 0xFFFFF3C4.toInt(), maxW = 340f)
+        val cw = 84f
+        val ch = 98f
+        for ((i, sk) in Skins.all.withIndex()) {
+            val col = i % 4
+            val row = i / 4
+            val x = 3f + col * (cw + 6f)
+            val y = 248f + row * (ch + 6f)
+            val owned = save.ownsSkin(i)
+            val rc = Rarity.colors[sk.rarity]
+            panel(c, x, y, cw, ch, if (owned) 0x66000000 else 0x44000000, 12f)
+            p.style = Paint.Style.STROKE
+            p.strokeWidth = if (i == wearing) 3.5f else 2f
+            p.color = if (i == wearing) k(0xFFFFFFFF) else (rc and 0x00FFFFFF) or (if (owned) 0xFF000000.toInt() else 0x55000000)
+            c.drawRoundRect(x, y, x + cw, y + ch, 12f, 12f, p)
+            p.style = Paint.Style.FILL
+            drawTilcayo(c, x + cw / 2, y + 40f, 22f, 1, 0f, 1f, 1f, 1, i, hidden = !owned)
+            if (owned) {
+                text(c, sk.name, x + cw / 2, y + 79f, 10f, 0xFFFFFFFF.toInt(), maxW = cw - 6f)
+                if (i == wearing) text(c, "✔", x + cw - 12f, y + 16f, 14f, 0xFF00E676.toInt())
+            } else {
+                text(c, "?", x + cw / 2, y + 48f, 26f, 0x88FFFFFF.toInt(), shadow = false)
+                text(c, "???", x + cw / 2, y + 79f, 10f, 0x88FFFFFF.toInt())
+            }
+            text(c, Rarity.names[sk.rarity], x + cw / 2, y + 92f, 8f, rc, maxW = cw - 6f)
+            buttons.add(Btn(x, y, cw, ch) {
+                if (boxStage != 0) return@Btn
+                if (owned) {
+                    save.setSkin(sel, i)
+                    save.save()
+                    sfx.play(Sfx.S.BUY)
+                    toast("Надет скин «${sk.name}»")
+                } else {
+                    toast("Скин пока не выпал — открывай боксы!")
+                }
+            })
+        }
+        text(c, "Скинов собрано: ${Skins.all.indices.count { save.ownsSkin(it) }} / ${Skins.all.size}", 180f, 756f, 13f, 0xAAFFFFFF.toInt())
+        btn(c, "▶  К ФЕРМЕ", 100f, 764f, 160f, 30f, k(0xFF00C853)) { if (boxStage == 0) goFarm() }
+
+        if (toastT > 0f && boxStage == 0) {
+            val a = min(1f, toastT * 3f)
+            panel(c, 40f, 222f, 280f, 30f, ((a * 200).toInt() shl 24), 15f)
+            text(c, toastText, 180f, 243f, 15f, ((a * 255).toInt() shl 24) or 0xFFFFFF, maxW = 260f)
+        }
+
+        if (boxStage != 0) drawBoxOverlay(c, dt)
+        c.restore()
+    }
+
+    private fun drawBoxOverlay(c: Canvas, dt: Float) {
+        boxT += dt
+        // перехватываем нажатия под оверлеем
+        buttons.add(Btn(-300f, -300f, 1000f, 1600f) {})
+        p.style = Paint.Style.FILL
+        p.color = 0xCC000000.toInt()
+        c.drawRect(-300f, -300f, 700f, 1300f, p)
+        val bt = Boxes.all[boxKind]
+        val sk = Skins.all[boxSkin]
+        val rc = Rarity.colors[sk.rarity]
+
+        if (boxStage == 1) {
+            val k1 = (boxT / 1.8f).coerceIn(0f, 1f)
+            c.save()
+            c.translate(180f, 330f)
+            c.rotate(sin(boxT * (18f + boxT * 30f)) * (4f + k1 * 14f))
+            val s = 1f + 0.18f * k1 + 0.04f * sin(boxT * 40f)
+            c.scale(s, s)
+            text(c, bt.emoji, 0f, 40f, 130f, shadow = false)
+            c.restore()
+            text(c, "Что же внутри…", 180f, 520f, 20f, 0xCCFFFFFF.toInt())
+            if (boxT >= 1.8f) {
+                boxStage = 2
+                boxT = 0f
+                sfx.play(when (sk.rarity) { 0 -> Sfx.S.REVEAL_C; 1 -> Sfx.S.REVEAL_R; 2 -> Sfx.S.REVEAL_E; else -> Sfx.S.REVEAL_L })
+                performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                val n = 20 + sk.rarity * 20
+                for (j in 0 until n) {
+                    val a = rnd.nextFloat() * 2f * PI.toFloat()
+                    val sp = 80f + rnd.nextFloat() * (200f + sk.rarity * 80f)
+                    particles.add(Particle(180f, 330f, cos(a) * sp, sin(a) * sp - 60f, 1.4f, 1.4f, if (j % 2 == 0) rc else 0xFFFFFFFF.toInt(), 3f + rnd.nextFloat() * 4f))
+                }
+            }
+        } else {
+            // свечение редкости
+            val pulse = 1f + 0.05f * sin(boxT * 4f)
+            for (j in 5 downTo 1) {
+                p.color = (rc and 0x00FFFFFF) or ((0x18 + (5 - j) * 0x0C) shl 24)
+                c.drawCircle(180f, 330f, (60f + j * 22f) * pulse, p)
+            }
+            val flash = (1f - boxT * 3f).coerceIn(0f, 1f)
+            val pop = min(1f, boxT * 4f)
+            val bob = sin(boxT * 3f)
+            drawTilcayo(c, 180f, 330f + bob * 5f, 78f * (0.4f + 0.6f * pop), 1, bob * 3f, 1f, 1f, 1, boxSkin)
+            text(c, Rarity.names[sk.rarity].uppercase(), 180f, 468f, 22f, rc, maxW = 300f)
+            text(c, sk.name, 180f, 500f, 30f, maxW = 320f)
+            if (boxDup) {
+                text(c, "Уже есть! Вернули +${Rarity.refund[sk.rarity]} 💰", 180f, 532f, 16f, 0xFFFFE082.toInt(), maxW = 320f)
+            } else {
+                text(c, "✨ НОВЫЙ СКИН! ✨", 180f, 532f, 18f, 0xFF00E676.toInt())
+            }
+            if (flash > 0f) {
+                p.color = ((flash * 255).toInt() shl 24) or 0xFFFFFF
+                c.drawRect(-300f, -300f, 700f, 1300f, p)
+            }
+            btn(c, "ЗАБРАТЬ", 40f, 570f, 130f, 56f, k(0xFF00C853)) {
+                if (!save.ownsSkin(boxSkin) || true) {
+                    // сразу надеваем новый скин на выбранного
+                    if (!boxDup) { save.setSkin(save.selected, boxSkin); save.save() }
+                }
+                boxStage = 0
+            }
+            val again = if (boxFree && save.freeBoxes > 0) true else save.coins >= bt.price
+            btn(c, "ЕЩЁ РАЗ", 190f, 570f, 130f, 56f, k(0xFFFFA000), sub = if (boxFree && save.freeBoxes > 0) "бесплатно" else "${bt.price} 💰", enabled = again) {
+                val free = boxFree && save.freeBoxes > 0
+                boxStage = 0
+                buyBox(boxKind, free)
+            }
+        }
+        drawParticles(c)
     }
 }
