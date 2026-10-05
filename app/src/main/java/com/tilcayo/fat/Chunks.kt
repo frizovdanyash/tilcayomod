@@ -71,12 +71,19 @@ object ChunkLib {
 /** Выбирает, что положить дальше: проверенные куски, передышки с монетками, вкусняшки и пушки. */
 class Gen(private val sim: Sim, private val lib: List<ChunkTemplate>, private val rnd: Random) {
     private var lastCannonH = 0f
+    private var lastBossH = 0f
+
+    /** Босс появляется редко: не раньше bossMinH, не чаще раза в bossCooldown и с шансом bossChance на каждом куске. */
+    var bossMinH = 3000f
+    var bossCooldown = 5000f
+    var bossChance = 0.08f
     private var calmUntil = Float.POSITIVE_INFINITY
     private var lastWasBreather = false
     private val recent = ArrayDeque<Int>()
 
     fun reset() {
         lastCannonH = 0f
+        lastBossH = 0f
         calmUntil = Float.POSITIVE_INFINITY
         lastWasBreather = false
         recent.clear()
@@ -93,6 +100,7 @@ class Gen(private val sim: Sim, private val lib: List<ChunkTemplate>, private va
         val ch: Float = when {
             h < 100f -> coinChunk(y)
             !calm && h > 350f && h - lastCannonH > 1700f -> cannonChunk(y, h)
+            !calm && sim.arena == null && h > bossMinH && h - lastBossH > bossCooldown && rnd.nextFloat() < bossChance -> bossChunk(y, h)
             calm -> if (rnd.nextFloat() < 0.2f) snackChunk(y) else coinChunk(y)
             h > 150f && rnd.nextFloat() < 0.07f -> snackChunk(y)
             !lastWasBreather && rnd.nextFloat() < 0.2f -> { lastWasBreather = true; coinChunk(y) }
@@ -190,6 +198,15 @@ class Gen(private val sim: Sim, private val lib: List<ChunkTemplate>, private va
             },
         )
         return 140f
+    }
+
+    /** Пустая арена: босс появится, когда игрок в неё войдёт. */
+    private fun bossChunk(y: Float, h: Float): Float {
+        val ah = min(620f, sim.viewH - 150f)
+        sim.arena = Arena(y - 40f - ah, y - 40f, min(7, 4 + sim.bossesBeaten))
+        lastBossH = h
+        lastWasBreather = false
+        return ah + 80f
     }
 
     private fun cannonChunk(y: Float, h: Float): Float {

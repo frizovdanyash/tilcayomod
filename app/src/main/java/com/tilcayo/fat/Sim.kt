@@ -71,6 +71,70 @@ class Pillar(val x0: Float, val y0: Float, val x1: Float, val y1: Float, val hot
 class Cannon(val x: Float, val y: Float) { var used = false; var ang = 0f }
 class Bumper(val x: Float, val y: Float) { var pop = 0f }
 
+/** Арена боя с боссом: пустой участок уровня. */
+class Arena(val top: Float, val bottom: Float, val hp: Int) {
+    var active = false
+    var done = false
+}
+
+/** Снаряд босса: клубок шерсти (kind 0) или морковка (kind 1). */
+class Hair(var x: Float, var y: Float, var vx: Float, var vy: Float, val kind: Int, var life: Float) {
+    fun copy() = Hair(x, y, vx, vy, kind, life)
+}
+
+/** Толстый Котозаяц. Все состояния — простые поля, поэтому его легко копировать для ботов. */
+class Boss(val hpMax: Int) {
+    var x = Phys.W / 2
+    var y = 0f
+    var hp = hpMax
+    var state = ENTER
+    var t = 0f
+    var hover = 0f
+    var stun = 0f
+    var flash = 0f
+    var attack = 0
+    var dir = 1
+    var fired = 0
+    var seed = 1234567
+    var tx = 0f
+    val cols = FloatArray(3)
+    var face = 1
+    var off = 0f
+    var dodgeT = 0f
+    var dodgeCd = 1.2f
+    var dodgeDir = 1
+
+    fun rand(): Float {
+        seed = seed * 1103515245 + 12345
+        return ((seed ushr 8) and 0xFFFF) / 65536f
+    }
+
+    fun copy(): Boss {
+        val b = Boss(hpMax)
+        b.x = x; b.y = y; b.hp = hp; b.state = state; b.t = t; b.hover = hover; b.stun = stun; b.flash = flash
+        b.attack = attack; b.dir = dir; b.fired = fired; b.seed = seed; b.tx = tx; b.face = face
+        b.off = off; b.dodgeT = dodgeT; b.dodgeCd = dodgeCd; b.dodgeDir = dodgeDir
+        cols.copyInto(b.cols)
+        return b
+    }
+
+    companion object {
+        const val R = 50f
+        const val ENTER = 0
+        const val HOVER = 1
+        const val VOLLEY_TELE = 2
+        const val VOLLEY_FIRE = 3
+        const val CHARGE_MOVE = 4
+        const val CHARGE_WARN = 5
+        const val CHARGE_GO = 6
+        const val CHARGE_BACK = 7
+        const val RAIN_TELE = 8
+        const val RAIN_FALL = 9
+        const val STUN = 10
+        const val DEAD = 11
+    }
+}
+
 /** Событие для звука и эффектов. */
 class Ev(val type: Int, val x: Float = 0f, val y: Float = 0f, val ref: Any? = null) {
     companion object {
@@ -85,6 +149,11 @@ class Ev(val type: Int, val x: Float = 0f, val y: Float = 0f, val ref: Any? = nu
         const val BUMP = 8
         const val LASER_ON = 9
         const val DIE = 10
+        const val BOSS_START = 11
+        const val BOSS_TELE = 12
+        const val BOSS_FIRE = 13
+        const val BOSS_HIT = 14
+        const val BOSS_DEAD = 15
     }
 }
 
@@ -92,6 +161,12 @@ class Snap(
     val px: Float, val py: Float, val pvx: Float, val pvy: Float,
     val side: Int, val face: Int, val onWall: Boolean, val clingIdx: Int,
     val jumpsLeft: Int, val jumpBuf: Float, val boostT: Float, val time: Float, val bumpCd: Float,
+)
+
+/** Снимок, который включает босса и снаряды (для тестов-ботов). */
+class FullState(
+    val snap: Snap, val boss: Boss?, val hairs: List<Hair>, val camY: Float, val lavaY: Float,
+    val minPy: Float, val runCoins: Float, val shield: Float, val arenaActive: Boolean, val dead: Boolean,
 )
 
 // ---------------------------------------------------------------------------
@@ -138,6 +213,12 @@ class Sim {
     var dead = false
     var deathReason = ""
     val events = ArrayList<Ev>()
+
+    // босс
+    var arena: Arena? = null
+    var boss: Boss? = null
+    val hairs = ArrayList<Hair>()
+    var bossesBeaten = 0
 
     // мир
     val coins = ArrayList<Coin>()
@@ -188,6 +269,10 @@ class Sim {
         deathReason = ""
         events.clear()
         clearWorld()
+        arena = null
+        boss = null
+        hairs.clear()
+        bossesBeaten = 0
     }
 
     fun stickX(s: Int) = if (s < 0) Phys.WALL + hr else Phys.W - Phys.WALL - hr
@@ -197,6 +282,20 @@ class Sim {
     // ---------- снимок для решателя ----------
 
     fun save() = Snap(px, py, pvx, pvy, side, face, onWall, if (cling == null) -1 else pillars.indexOf(cling!!), jumpsLeft, jumpBuf, boostT, time, bumpCd)
+
+    fun saveFull() = FullState(
+        save(), boss?.copy(), hairs.map { it.copy() }, camY, lavaY, minPy, runCoins, shield, arena?.active == true, dead,
+    )
+
+    fun loadFull(f: FullState) {
+        load(f.snap)
+        boss = f.boss?.copy()
+        hairs.clear()
+        for (h in f.hairs) hairs.add(h.copy())
+        camY = f.camY; lavaY = f.lavaY; minPy = f.minPy; runCoins = f.runCoins; shield = f.shield
+        arena?.active = f.arenaActive
+        dead = f.dead
+    }
 
     fun load(s: Snap) {
         px = s.px; py = s.py; pvx = s.pvx; pvy = s.pvy
@@ -298,18 +397,37 @@ class Sim {
         }
         if (py < minPy) minPy = py
 
+        val a = arena
+        val locked = a != null && a.active
+        if (a != null && !a.active && !a.done && py < a.bottom - 40f) startBoss(a)
+        if (locked) {
+            // потолок арены
+            if (py < a!!.top + hr) { py = a.top + hr; pvy = max(pvy, 0f) }
+        }
+
         if (camOn) {
-            val target = py - viewH * 0.62f
-            if (target < camY) camY += (target - camY) * min(1f, dt * 7f)
+            if (locked) {
+                val target = a!!.bottom + 55f - viewH
+                camY += (target - camY) * min(1f, dt * 4f)
+            } else {
+                val target = py - viewH * 0.62f
+                if (target < camY) camY += (target - camY) * min(1f, dt * 7f)
+            }
         }
         if (lavaOn) {
-            val height = -minPy
-            lavaY -= (30f + min(70f, height / 20f)) * dt
-            lavaY = min(lavaY, py + 500f)
+            if (locked) {
+                lavaY = a!!.bottom + 50f
+            } else {
+                val height = -minPy
+                lavaY -= (30f + min(70f, height / 20f)) * dt
+                lavaY = min(lavaY, py + 500f)
+            }
             if (shield <= 0f && py + hr > lavaY) return die("Тилкайо сгорел в лаве 🔥")
         }
         if (camOn && py - hr > camY + viewH + 20f) return die("Упал вниз 😵")
 
+        updateBoss(dt)
+        if (dead) return
         checkHazards(prevTime, time)
         if (dead) return
         if (collect) checkPickups()
@@ -454,6 +572,207 @@ class Sim {
                     break
                 }
             }
+        }
+    }
+
+    // ---------- босс ----------
+
+    private fun startBoss(a: Arena) {
+        a.active = true
+        val b = Boss(a.hp)
+        b.seed = 987654 + bossesBeaten * 7919
+        b.x = Phys.W / 2
+        b.y = a.top - 140f
+        boss = b
+        hairs.clear()
+        events.add(Ev(Ev.BOSS_START, b.x, b.y))
+    }
+
+    private fun ease(k: Float) = k * k * (3f - 2f * k)
+
+    private fun chooseAttack(b: Boss, phase: Int) {
+        var next = b.rand().times(3f).toInt().coerceIn(0, 2)
+        if (next == b.attack) next = (next + 1) % 3
+        b.attack = next
+        b.t = 0f
+        b.fired = 0
+        b.state = when (next) {
+            0 -> Boss.VOLLEY_TELE
+            1 -> { b.dir = if (b.rand() < 0.5f) 1 else -1; Boss.CHARGE_MOVE }
+            else -> {
+                // три колонны дождя на расстоянии друг от друга
+                val lo = Phys.WALL + 30f
+                val hi = Phys.W - Phys.WALL - 30f
+                for (i in 0 until 3) b.cols[i] = lo + (hi - lo) * ((i + 0.15f + 0.7f * b.rand()) / 3f)
+                Boss.RAIN_TELE
+            }
+        }
+        events.add(Ev(Ev.BOSS_TELE, b.x, b.y, next))
+    }
+
+    private fun updateBoss(dt: Float) {
+        val a = arena ?: return
+        val b = boss ?: return
+        b.flash = max(0f, b.flash - dt)
+        val phase = b.hpMax - b.hp
+        val mid = Phys.W / 2
+        val range = mid - Phys.WALL - Boss.R
+        val hoverY = a.top + 200f - 16f * phase
+        b.t += dt
+        when (b.state) {
+            Boss.ENTER -> {
+                val k = min(1f, b.t / 1.6f)
+                b.y = (a.top - 140f) + (hoverY - (a.top - 140f)) * ease(k)
+                if (b.t >= 1.6f) { b.state = Boss.HOVER; b.t = 0f }
+            }
+            Boss.HOVER -> {
+                b.hover += dt
+                b.dodgeCd = max(0f, b.dodgeCd - dt)
+                if (b.dodgeT > 0f) {
+                    b.dodgeT -= dt
+                    b.off += b.dodgeDir * 430f * dt
+                } else {
+                    b.off -= b.off * min(1f, dt * 1.2f)
+                }
+                b.x = (mid + sin(b.hover * 0.9f) * range * 0.8f + b.off).coerceIn(mid - range, mid + range)
+                b.y = hoverY + sin(b.hover * 1.7f) * 26f
+                b.face = if (cos(b.hover * 0.9f) >= 0f) 1 else -1
+                // видит, что сверху пикируют, — отпрыгивает в сторону
+                if (b.dodgeCd <= 0f && b.dodgeT <= 0f && py < b.y - 30f && py > b.y - 240f &&
+                    abs(px - b.x) < Boss.R + 26f && pvy > -80f
+                ) {
+                    b.dodgeDir = if (px >= b.x) -1 else 1
+                    if (b.x + b.dodgeDir * 140f !in (mid - range)..(mid + range)) b.dodgeDir = -b.dodgeDir
+                    b.dodgeT = 0.3f
+                    b.dodgeCd = max(0.9f, 1.7f - 0.15f * phase)
+                }
+                if (b.t >= max(0.3f, 0.95f - 0.1f * phase)) chooseAttack(b, phase)
+            }
+            Boss.VOLLEY_TELE -> {
+                b.y = hoverY + sin(b.t * 30f) * 2f
+                if (b.t >= max(0.45f, 0.85f - 0.07f * phase)) { b.state = Boss.VOLLEY_FIRE; b.t = 0f; b.fired = 0 }
+            }
+            Boss.VOLLEY_FIRE -> {
+                val n = min(8, 4 + phase)
+                if (b.t >= 0.14f * b.fired && b.fired < n) {
+                    b.fired++
+                    val ang = kotlin.math.atan2(py - b.y, px - b.x) + (b.rand() - 0.5f) * 0.9f
+                    val sp = 235f + 14f * phase
+                    hairs.add(Hair(b.x, b.y, cos(ang) * sp, sin(ang) * sp, 0, 6f))
+                    events.add(Ev(Ev.BOSS_FIRE, b.x, b.y))
+                }
+                if (b.fired >= n && b.t >= 0.14f * n + 0.35f) { b.state = Boss.HOVER; b.t = 0f }
+            }
+            Boss.CHARGE_MOVE -> {
+                val tx = mid - b.dir * range
+                b.x += (tx - b.x) * min(1f, dt * 5f)
+                b.y += (hoverY - b.y) * min(1f, dt * 5f)
+                if (b.t >= 0.7f) { b.state = Boss.CHARGE_WARN; b.t = 0f }
+            }
+            Boss.CHARGE_WARN -> {
+                b.face = b.dir
+                if (b.t >= max(0.4f, 0.8f - 0.07f * phase)) { b.state = Boss.CHARGE_GO; b.t = 0f }
+            }
+            Boss.CHARGE_GO -> {
+                b.x += b.dir * (470f + 40f * phase) * dt
+                if (b.dir > 0 && b.x >= mid + range) { b.x = mid + range; b.state = Boss.CHARGE_BACK; b.t = 0f }
+                if (b.dir < 0 && b.x <= mid - range) { b.x = mid - range; b.state = Boss.CHARGE_BACK; b.t = 0f }
+            }
+            Boss.CHARGE_BACK -> {
+                b.x += (mid - b.x) * min(1f, dt * 3f)
+                if (b.t >= 0.8f) { b.state = Boss.HOVER; b.t = 0f }
+            }
+            Boss.RAIN_TELE -> {
+                b.y = hoverY + sin(b.t * 30f) * 2f
+                if (b.t >= max(0.5f, 0.95f - 0.08f * phase)) { b.state = Boss.RAIN_FALL; b.t = 0f; b.fired = 0 }
+            }
+            Boss.RAIN_FALL -> {
+                // три залпа: в каждой колонне по морковке
+                if (b.fired < 3 && b.t >= 0.24f * b.fired) {
+                    b.fired++
+                    for (i in 0 until 3) hairs.add(Hair(b.cols[i], a.top - 10f, 0f, 380f + 20f * phase, 1, 6f))
+                    events.add(Ev(Ev.BOSS_FIRE, b.cols[1], a.top))
+                }
+                if (b.fired >= 3 && b.t >= 1.3f) { b.state = Boss.HOVER; b.t = 0f }
+            }
+            Boss.STUN -> {
+                b.x += (mid - b.x) * min(1f, dt * 1.5f)
+                b.y += (hoverY + 40f - b.y) * min(1f, dt * 2f)
+                if (b.t >= 1.25f) { b.state = Boss.HOVER; b.t = 0f }
+            }
+            Boss.DEAD -> {
+                b.y += 160f * dt
+                if (b.t >= 2.2f) {
+                    boss = null
+                    hairs.clear()
+                    a.active = false
+                    a.done = true
+                    arena = null
+                    bossesBeaten++
+                    lavaY = a.bottom + 320f
+                }
+            }
+        }
+        // снаряды
+        val it = hairs.iterator()
+        while (it.hasNext()) {
+            val h = it.next()
+            h.x += h.vx * dt
+            h.y += h.vy * dt
+            h.life -= dt
+            if (h.life <= 0f || h.y > a.bottom + 60f || h.y < a.top - 90f || h.x < Phys.WALL - 6f || h.x > Phys.W - Phys.WALL + 6f) it.remove()
+        }
+        if (b.state == Boss.DEAD) return
+
+        // столкновения с игроком
+        val hh = hr + hrExtra
+        val invuln = shield > 0f || inCannon != null
+        if (!invuln) {
+            for (h in hairs) {
+                val dx = h.x - px
+                val dy = h.y - py
+                val rr = hh + (if (h.kind == 0) 9f else 10f)
+                if (dx * dx + dy * dy < rr * rr) return die(if (h.kind == 0) "Получил клубком шерсти 🧶" else "Прилетело морковкой 🥕")
+            }
+        }
+        if (b.state != Boss.ENTER && inCannon == null) {
+            val dx = px - b.x
+            val dy = py - b.y
+            val rr = hr + Boss.R * 0.92f
+            if (dx * dx + dy * dy < rr * rr) {
+                if (b.state == Boss.STUN) return
+                if (pvy > 40f && py < b.y - Boss.R * 0.2f) {
+                    stomp(b, a)
+                } else if (shield <= 0f) {
+                    die("Толстый Котозаяц тебя расплющил 🐰")
+                }
+            }
+        }
+    }
+
+    private fun stomp(b: Boss, a: Arena) {
+        b.hp--
+        b.flash = 0.5f
+        pvy = -560f
+        pvx = if (px < b.x) -120f else 120f
+        onWall = false
+        cling = null
+        jumpsLeft = Phys.MAX_AIR
+        shield = 0.8f
+        hairs.clear()
+        events.add(Ev(Ev.BOSS_HIT, b.x, b.y))
+        if (b.hp <= 0) {
+            b.state = Boss.DEAD
+            b.t = 0f
+            runCoins += coinMul * 150f
+            for (i in 0 until 24) {
+                val ang = i * Phys.TAU / 24f
+                coins.add(Coin(b.x + cos(ang) * 70f, b.y + sin(ang) * 55f))
+            }
+            events.add(Ev(Ev.BOSS_DEAD, b.x, b.y))
+        } else {
+            b.state = Boss.STUN
+            b.t = 0f
         }
     }
 

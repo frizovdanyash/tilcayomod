@@ -5,6 +5,8 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
 import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Path
@@ -84,6 +86,7 @@ class GameView(context: Context) : View(context) {
     private val sfx = Sfx(context)
     private val music = Music()
     private val sprite: Bitmap = BitmapFactory.decodeResource(resources, R.drawable.tilcayo)
+    private val bossSprite: Bitmap = BitmapFactory.decodeResource(resources, R.drawable.boss)
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
     private val bmpPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
     private val tp = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -157,6 +160,9 @@ class GameView(context: Context) : View(context) {
     private val bumpers get() = sim.bumpers
 
     private val sawPos = FloatArray(2)
+    private var bossBanner = 0f
+    private var bossHint = 0f
+    private val boss: Boss? get() = sim.boss
     private var runLevel = 1
     private var shake = 0f
     private var combo = 0
@@ -368,6 +374,8 @@ class GameView(context: Context) : View(context) {
         gotSnacks = 0
         newRecord = false
         gesturePtr = -1
+        bossBanner = 0f
+        bossHint = 0f
         particles.clear()
         pops.clear()
     }
@@ -376,6 +384,8 @@ class GameView(context: Context) : View(context) {
         comboT = max(0f, comboT - dt)
         if (comboT <= 0f) combo = 0
         shake = max(0f, shake - dt)
+        bossBanner = max(0f, bossBanner - dt)
+        bossHint = max(0f, bossHint - dt)
         for (b in sim.bumpers) b.pop = max(0f, b.pop - dt)
 
         sim.step(dt)
@@ -451,6 +461,39 @@ class GameView(context: Context) : View(context) {
                     (ev.ref as Bumper).pop = 0.3f
                     sfx.play(Sfx.S.BUMP, 0.9f + rnd.nextFloat() * 0.3f)
                     ring(ev.x, ev.y, 0xFFFF8AD8.toInt())
+                }
+                Ev.BOSS_START -> {
+                    bossBanner = 3f
+                    bossHint = 6f
+                    shake = 0.5f
+                    sfx.play(Sfx.S.BOSS_ROAR)
+                    performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                }
+                Ev.BOSS_TELE -> sfx.play(Sfx.S.WARN)
+                Ev.BOSS_FIRE -> sfx.play(Sfx.S.LASER, 0.8f, 0.5f)
+                Ev.BOSS_HIT -> {
+                    shake = 0.45f
+                    bossHint = 0f
+                    sfx.play(Sfx.S.BOSS_HIT)
+                    performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                    sparkle(ev.x, ev.y, 0xFFFFFFFF.toInt())
+                    for (i in 0 until 14) {
+                        val a = rnd.nextFloat() * 2f * PI.toFloat()
+                        val sp = 100f + rnd.nextFloat() * 200f
+                        particles.add(Particle(ev.x, ev.y - 20f, cos(a) * sp, sin(a) * sp - 80f, 0.7f, 0.7f, 0xFFB0BEC5.toInt(), 3f + rnd.nextFloat() * 3f))
+                    }
+                    pops.add(Pop(ev.x, ev.y - 70f, "БАМ!", 0xFFFFD54F.toInt(), 26f))
+                }
+                Ev.BOSS_DEAD -> {
+                    shake = 0.7f
+                    sfx.play(Sfx.S.BOSS_DEAD)
+                    pops.add(Pop(W / 2, sim.camY + viewH * 0.3f, "ПОБЕДА!", 0xFFFFD54F.toInt(), 34f))
+                    pops.add(Pop(W / 2, sim.camY + viewH * 0.3f + 40f, "+" + fmt(sim.coinMul * 150f) + " монет", 0xFFFFE082.toInt(), 18f))
+                    for (i in 0 until 40) {
+                        val a = rnd.nextFloat() * 2f * PI.toFloat()
+                        val sp = 80f + rnd.nextFloat() * 280f
+                        particles.add(Particle(ev.x, ev.y, cos(a) * sp, sin(a) * sp - 120f, 1.2f, 1.2f, blockColors[i % 5], 3f + rnd.nextFloat() * 4f))
+                    }
                 }
                 Ev.LASER_ON -> if (ev.y > sim.camY && ev.y < sim.camY + viewH) sfx.play(Sfx.S.LASER, 1.4f, 0.4f)
             }
@@ -895,6 +938,8 @@ class GameView(context: Context) : View(context) {
             particles.add(Particle(rnd.nextFloat() * W, lavaY, (rnd.nextFloat() - 0.5f) * 40f, -80f - rnd.nextFloat() * 80f, 0.8f, 0.8f, k(0xFFFFB74D), 2.5f))
         }
 
+        drawBoss(c, top, bot)
+
         // тилкайо
         if (scene == Scene.PLAY && inCannon == null) {
             val rot = if (onWall) side * 10f else (face * pvy / 20f).coerceIn(-25f, 25f)
@@ -948,6 +993,101 @@ class GameView(context: Context) : View(context) {
         c.restore()
     }
 
+    private fun drawBoss(c: Canvas, top: Float, bot: Float) {
+        val a = sim.arena
+        val b = sim.boss
+        if (a != null && a.active) {
+            // потолок арены
+            p.style = Paint.Style.FILL
+            p.color = 0x99140A28.toInt()
+            c.drawRect(WALL, a.top - 400f, W - WALL, a.top, p)
+            p.color = k(0xFF7C4DFF)
+            c.drawRect(WALL, a.top - 3f, W - WALL, a.top, p)
+        }
+        if (b == null) return
+        val phase = b.hpMax - b.hp
+        // телеграфы атак
+        if (b.state == Boss.RAIN_TELE && a != null) {
+            val blink = if ((anim * 10f).toInt() % 2 == 0) 0x55FF1744 else 0x33FF1744
+            p.style = Paint.Style.FILL
+            p.color = blink
+            for (i in 0 until 3) {
+                c.drawRect(b.cols[i] - 15f, a.top, b.cols[i] + 15f, a.bottom, p)
+                text(c, "!", b.cols[i], a.top + 40f, 30f, 0xFFFF1744.toInt(), shadow = false)
+            }
+        }
+        if (b.state == Boss.CHARGE_WARN || b.state == Boss.CHARGE_MOVE) {
+            val blink = if ((anim * 12f).toInt() % 2 == 0) 0x66FF1744 else 0x22FF1744
+            p.style = Paint.Style.FILL
+            p.color = blink
+            c.drawRect(WALL, b.y - Boss.R, W - WALL, b.y + Boss.R, p)
+            text(c, if (b.dir > 0) "▶▶▶" else "◀◀◀", W / 2, b.y + 10f, 32f, 0xFFFF1744.toInt(), shadow = false)
+        }
+        // снаряды
+        for (h in sim.hairs) {
+            if (h.kind == 0) {
+                p.style = Paint.Style.FILL
+                p.color = k(0xFF9E9E9E)
+                c.drawCircle(h.x, h.y, 9f, p)
+                p.color = k(0xFFCFD8DC)
+                c.drawCircle(h.x - 2f, h.y - 2f, 6f, p)
+                p.style = Paint.Style.STROKE
+                p.strokeWidth = 1.5f
+                p.color = k(0xFF757575)
+                for (j in 0 until 5) {
+                    val ang = anim * 6f + j * 1.2566f
+                    c.drawLine(h.x, h.y, h.x + cos(ang) * 12f, h.y + sin(ang) * 12f, p)
+                }
+                p.style = Paint.Style.FILL
+            } else {
+                text(c, "🥕", h.x, h.y + 8f, 22f, shadow = false)
+            }
+        }
+        // сам Толстый Котозаяц
+        var sx = 1f + 0.03f * sin(anim * 2.4f)
+        var sy = 1f - 0.03f * sin(anim * 2.4f)
+        var rot = 0f
+        var alpha = 255
+        when (b.state) {
+            Boss.VOLLEY_TELE, Boss.RAIN_TELE -> { val k2 = 0.1f * sin(b.t * 30f).coerceIn(-1f, 1f); sx = 1.12f + k2; sy = 1.12f - k2 }
+            Boss.CHARGE_WARN -> rot = sin(b.t * 50f) * 5f
+            Boss.CHARGE_GO -> rot = b.dir * 12f
+            Boss.STUN -> rot = sin(anim * 18f) * 9f
+            Boss.DEAD -> { rot = b.t * 400f; alpha = (255 * (1f - b.t / 2.2f)).toInt().coerceIn(0, 255) }
+        }
+        val w = Boss.R * 2.75f
+        val h = w * bossSprite.height / bossSprite.width
+        c.save()
+        c.translate(b.x, b.y - 4f)
+        c.rotate(rot)
+        c.scale(sx, sy)
+        rect.set(-w / 2, -h / 2, w / 2, h / 2)
+        bmpPaint.alpha = alpha
+        if (b.flash > 0f) {
+            val f = b.flash / 0.5f * 160f
+            bmpPaint.colorFilter = ColorMatrixColorFilter(ColorMatrix(floatArrayOf(1f, 0f, 0f, 0f, f, 0f, 1f, 0f, 0f, f, 0f, 0f, 1f, 0f, f, 0f, 0f, 0f, 1f, 0f)))
+        } else if (b.state == Boss.VOLLEY_TELE || b.state == Boss.RAIN_TELE || b.state == Boss.CHARGE_WARN) {
+            bmpPaint.colorFilter = ColorMatrixColorFilter(ColorMatrix(floatArrayOf(1.15f, 0f, 0f, 0f, 20f, 0f, 0.85f, 0f, 0f, 0f, 0f, 0f, 0.85f, 0f, 0f, 0f, 0f, 0f, 1f, 0f)))
+        }
+        c.drawBitmap(bossSprite, null, rect, bmpPaint)
+        bmpPaint.colorFilter = null
+        bmpPaint.alpha = 255
+        // злые брови во время атаки, обиженные глазки в стане
+        val eyeY = -h * 0.21f
+        val angry = b.state != Boss.HOVER && b.state != Boss.ENTER && b.state != Boss.STUN && b.state != Boss.DEAD
+        if (angry) {
+            p.style = Paint.Style.STROKE
+            p.strokeWidth = 5f
+            p.color = k(0xFF3E1A1A)
+            c.drawLine(-w * 0.26f, eyeY - 16f, -w * 0.07f, eyeY - 6f, p)
+            c.drawLine(w * 0.26f, eyeY - 16f, w * 0.07f, eyeY - 6f, p)
+            p.style = Paint.Style.FILL
+        }
+        c.restore()
+        if (b.state == Boss.STUN) text(c, "💫", b.x, b.y - h * 0.55f, 26f, shadow = false)
+        if (phase >= 2 && b.state != Boss.DEAD) text(c, "💢", b.x + w * 0.38f, b.y - h * 0.38f, 20f, shadow = false)
+    }
+
     private fun drawSaw(c: Canvas, x: Float, y: Float, ang: Float) {
         c.save()
         c.translate(x, y)
@@ -980,6 +1120,27 @@ class GameView(context: Context) : View(context) {
         text(c, "💰 ${runCoins.toInt()}", 20f, 58f, 19f, 0xFFFFE082.toInt(), Paint.Align.LEFT, maxW = 84f)
         if (coinMul > 1f) text(c, "x${fmt(coinMul)}", 12f, 82f, 12f, 0xAAFFFFFF.toInt(), Paint.Align.LEFT)
         if (combo >= 3) text(c, "комбо x$combo", 12f, 100f, 13f, 0xFFFFD54F.toInt(), Paint.Align.LEFT)
+        // босс: полоска здоровья, баннер, подсказка
+        val bs = sim.boss
+        if (bs != null && bs.state != Boss.DEAD) {
+            panel(c, 40f, 94f, 280f, 34f, 0x99000000.toInt(), 17f)
+            text(c, "ТОЛСТЫЙ КОТОЗАЯЦ", W / 2, 111f, 12f, 0xFFFFF3C4.toInt(), maxW = 250f)
+            val segW = 250f / bs.hpMax
+            for (i in 0 until bs.hpMax) {
+                p.style = Paint.Style.FILL
+                p.color = if (i < bs.hp) k(0xFFFF5470) else 0x44FFFFFF
+                c.drawRoundRect(55f + i * segW + 2f, 117f, 55f + (i + 1) * segW - 2f, 123f, 3f, 3f, p)
+            }
+        }
+        if (bossBanner > 0f) {
+            val ba = min(1f, bossBanner).coerceIn(0f, 1f)
+            val col = ((ba * 255).toInt() shl 24) or 0xFFFF1744.toInt().and(0xFFFFFF)
+            text(c, "⚠ БОСС ⚠", W / 2, viewH * 0.36f, 40f, col, maxW = 330f)
+            text(c, "ТОЛСТЫЙ КОТОЗАЯЦ", W / 2, viewH * 0.36f + 34f, 24f, ((ba * 255).toInt() shl 24) or 0xFFFFFF, maxW = 330f)
+        } else if (bossHint > 0f && bs != null) {
+            val ha = min(1f, bossHint).coerceIn(0f, 1f)
+            text(c, "ПРЫГАЙ ЕМУ НА ГОЛОВУ СВЕРХУ!", W / 2, viewH * 0.8f, 16f, ((ha * 255).toInt() shl 24) or 0xFFFFFF, maxW = 330f)
+        }
         // кнопка паузы
         panel(c, W - 48f, 14f, 36f, 36f, 0x77000000, 18f)
         p.style = Paint.Style.FILL
@@ -988,7 +1149,7 @@ class GameView(context: Context) : View(context) {
         c.drawRoundRect(W - 27f, 24f, W - 22f, 40f, 2f, 2f, p)
         if (inCannon != null && (anim * 4f).toInt() % 2 == 0) {
             text(c, "ТАП — ВЫСТРЕЛ!", W / 2, viewH * 0.3f, 24f, 0xFFFFC107.toInt(), maxW = 300f)
-        } else if (runTime < 7f && inCannon == null) {
+        } else if (runTime < 7f && inCannon == null && sim.boss == null) {
             val a = (1f - runTime / 7f).coerceIn(0f, 1f)
             val col = ((a * 255).toInt() shl 24) or 0xFFFFFF
             text(c, "ТАП — прыжок на другую стену", W / 2, viewH * 0.78f, 17f, col, maxW = 320f)

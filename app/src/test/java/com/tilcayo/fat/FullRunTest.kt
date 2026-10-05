@@ -19,6 +19,7 @@ class FullRunTest {
         val real = Sim()
         real.reset(level, 1f, 800f)
         val gen = Gen(real, lib, Random(seed))
+        gen.bossChance = 0f
         gen.fill(real.camY - 800f)
         val planner = Sim().apply { lavaOn = false; camOn = false; collect = false; hrExtra = 4f }
         var replans = 0
