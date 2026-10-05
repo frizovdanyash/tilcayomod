@@ -155,6 +155,8 @@ object Verifier {
                         sim.step(1e-3f)
                         val valid = !sim.dead
                         sim.load(start)
+                        // с самого низа куска игрок обязан иметь возможность встать на любую стену
+                        if (!valid && yE == entries[0]) return Report(false, null, totalStates)
                         if (!valid) continue
                         val solver = Solver(sim)
                         val end = solver.solve(start, -tpl.height + 20f, yE + MAX_DROP, dyn, cap)

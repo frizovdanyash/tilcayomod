@@ -46,32 +46,103 @@ object Balance {
     fun breedMs(herdSize: Int) = 180_000L * herdSize
 }
 
+/** Одна ферма: своё стадо, свои наряды и своя беременность. */
+class Farm {
+    val herd = mutableListOf(0)
+    val skin = mutableListOf(0)
+    var selected = 0
+    var breedEnd = 0L
+
+    fun addPet(fat: Int = 0, skinId: Int = 0) {
+        herd.add(fat)
+        skin.add(skinId)
+    }
+
+    fun normalize() {
+        if (herd.isEmpty()) herd.add(0)
+        while (skin.size < herd.size) skin.add(0)
+        while (skin.size > herd.size) skin.removeAt(skin.size - 1)
+        for (i in skin.indices) if (skin[i] !in Skins.all.indices) skin[i] = 0
+        if (selected !in herd.indices) selected = 0
+    }
+}
+
 /** Всё, что сохраняется между запусками. */
 class SaveData(context: Context) {
     private val sp = context.getSharedPreferences("tilcayo", Context.MODE_PRIVATE)
 
     var coins: Long = sp.getLong("coins", 50L)
     var best: Int = sp.getInt("best", 0)
-    var selected: Int = sp.getInt("selected", 0)
     var sound: Boolean = sp.getBoolean("sound", true)
-    /** Когда родится малыш (мс), 0 — никто не вынашивается. */
-    var breedEnd: Long = sp.getLong("breedEnd", 0L)
     var lastCollect: Long = sp.getLong("lastCollect", System.currentTimeMillis())
-    val herd: MutableList<Int> = (sp.getString("herd", "0") ?: "0")
-        .split(",").mapNotNull { it.toIntOrNull() }.toMutableList()
-        .ifEmpty { mutableListOf(0) }
 
-    init {
-        if (selected !in herd.indices) selected = 0
+    /** Сколько ферм открыто и какая сейчас выбрана. */
+    var unlocked: Int = sp.getInt("unlocked", 1).coerceIn(1, Farms.COUNT)
+    var activeFarm: Int = sp.getInt("activeFarm", 0)
+
+    /** Какие скины открыты (битовая маска). */
+    var ownedSkins: Long = sp.getLong("ownedSkins", 1L) or 1L
+
+    /** Бесплатные боксы (за победу над боссом). */
+    var freeBoxes: Int = sp.getInt("freeBoxes", 0)
+
+    val farms: List<Farm> = List(Farms.COUNT) { i ->
+        val sfx = if (i == 0) "" else "$i"
+        Farm().also { f ->
+            f.herd.clear()
+            (sp.getString("herd$sfx", if (i == 0) "0" else "") ?: "").split(",").mapNotNull { it.toIntOrNull() }.forEach { f.herd.add(it) }
+            (sp.getString("skins$sfx", "") ?: "").split(",").mapNotNull { it.toIntOrNull() }.forEach { f.skin.add(it) }
+            f.selected = sp.getInt("selected$sfx", 0)
+            f.breedEnd = sp.getLong("breedEnd$sfx", 0L)
+            f.normalize()
+        }
     }
 
-    fun level(i: Int) = Balance.level(herd[i])
-    fun totalLevels() = herd.indices.sumOf { level(it) }
+    init {
+        if (activeFarm !in 0 until unlocked) activeFarm = 0
+    }
 
-    /** Множитель монет в забеге: чем больше и жирнее стадо, тем жирнее куш. */
+    val farm: Farm get() = farms[activeFarm]
+    val herd: MutableList<Int> get() = farm.herd
+    var selected: Int
+        get() = farm.selected
+        set(v) { farm.selected = v }
+    var breedEnd: Long
+        get() = farm.breedEnd
+        set(v) { farm.breedEnd = v }
+
+    fun level(i: Int) = Balance.level(herd[i])
+    fun skinOf(i: Int) = farm.skin[i]
+    fun setSkin(i: Int, id: Int) { farm.skin[i] = id }
+
+    fun ownsSkin(id: Int) = (ownedSkins shr id) and 1L == 1L
+
+    /** Выдаёт скин; true — это был дубликат и вернулись деньги. */
+    fun giveSkin(id: Int): Boolean {
+        if (ownsSkin(id)) {
+            coins += Rarity.refund[Skins.all[id].rarity]
+            save()
+            return true
+        }
+        ownedSkins = ownedSkins or (1L shl id)
+        save()
+        return false
+    }
+
+    fun totalLevels(): Int {
+        var n = 0
+        for (fi in 0 until unlocked) n += farms[fi].herd.sumOf { Balance.level(it) }
+        return n
+    }
+
+    /** Множитель монет в забеге: чем больше и жирнее стада, тем жирнее куш. */
     fun coinMultiplier() = 1f + (totalLevels() - 1) * 0.04f
 
-    fun incomePerMin() = totalLevels() * 0.5f
+    fun incomePerMin(): Float {
+        var v = 0f
+        for (fi in 0 until unlocked) v += farms[fi].herd.sumOf { Balance.level(it) } * 0.5f * Farms.all[fi].incomeMul
+        return v
+    }
 
     fun pending(): Long {
         val sec = min((System.currentTimeMillis() - lastCollect) / 1000, Balance.OFFLINE_CAP_SEC)
@@ -86,28 +157,56 @@ class SaveData(context: Context) {
         return got
     }
 
-    fun pregnant() = breedEnd > 0L
-
-    fun breedLeftMs() = max(0L, breedEnd - System.currentTimeMillis())
-
-    /** Рождается ли сейчас малыш. Возвращает true в момент рождения. */
-    fun checkBirth(): Boolean {
-        if (breedEnd <= 0L || System.currentTimeMillis() < breedEnd) return false
-        breedEnd = 0L
-        if (herd.size < Balance.MAX_HERD) herd.add(0)
+    fun unlockFarm(): Boolean {
+        if (unlocked >= Farms.COUNT) return false
+        val cost = Farms.all[unlocked].unlockCost
+        if (coins < cost) return false
+        coins -= cost
+        activeFarm = unlocked
+        unlocked++
+        farms[activeFarm].apply { herd.clear(); skin.clear(); addPet(); selected = 0; breedEnd = 0L }
         save()
         return true
     }
 
+    fun pregnant() = breedEnd > 0L
+
+    fun breedLeftMs() = max(0L, breedEnd - System.currentTimeMillis())
+
+    /** Рождается ли сейчас малыш на какой-нибудь ферме. Возвращает true в момент рождения. */
+    fun checkBirth(): Boolean {
+        var any = false
+        val now = System.currentTimeMillis()
+        for (fi in 0 until unlocked) {
+            val f = farms[fi]
+            if (f.breedEnd > 0L && now >= f.breedEnd) {
+                f.breedEnd = 0L
+                if (f.herd.size < Balance.MAX_HERD) f.addPet()
+                any = true
+            }
+        }
+        if (any) save()
+        return any
+    }
+
     fun save() {
-        sp.edit()
+        val e = sp.edit()
             .putLong("coins", coins)
             .putInt("best", best)
-            .putInt("selected", selected)
             .putBoolean("sound", sound)
-            .putLong("breedEnd", breedEnd)
             .putLong("lastCollect", lastCollect)
-            .putString("herd", herd.joinToString(","))
-            .apply()
+            .putInt("unlocked", unlocked)
+            .putInt("activeFarm", activeFarm)
+            .putLong("ownedSkins", ownedSkins)
+            .putInt("freeBoxes", freeBoxes)
+        for (i in farms.indices) {
+            val sfx = if (i == 0) "" else "$i"
+            val f = farms[i]
+            e.putString("herd$sfx", f.herd.joinToString(","))
+            e.putString("skins$sfx", f.skin.joinToString(","))
+            e.putInt("selected$sfx", f.selected)
+            e.putLong("breedEnd$sfx", f.breedEnd)
+        }
+        e.apply()
     }
 }

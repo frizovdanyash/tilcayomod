@@ -34,7 +34,7 @@ import kotlin.random.Random
  */
 class GameView(context: Context) : View(context) {
 
-    private enum class Scene { MENU, PLAY, DEAD, FARM }
+    private enum class Scene { MENU, PLAY, DEAD, FARM, WARDROBE }
 
     // ---------- эффекты и UI ----------
     private class Particle(
@@ -57,7 +57,12 @@ class GameView(context: Context) : View(context) {
         var ph = 0f
         var hops = 0
         var spin = 0f
+        var spinV = 0f
         var hvx = 0f
+        var gvx = 0f
+        var gvy = 0f
+        var dizzy = 0f
+        var squash = 0f
 
         companion object {
             const val IDLE = 0
@@ -65,6 +70,8 @@ class GameView(context: Context) : View(context) {
             const val HOP = 2
             const val FLIP = 3
             const val EAT = 4
+            const val FLY = 5
+            const val DRAG = 6
         }
     }
 
@@ -106,7 +113,7 @@ class GameView(context: Context) : View(context) {
     private val stars = List(70) { Triple(rnd.nextFloat() * 360f, rnd.nextFloat() * 900f, 0.6f + rnd.nextFloat() * 1.8f) }
     private val decor = run {
         val r = Random(42)
-        List(26) { Triple(GX0 - 10f + r.nextFloat() * (GX1 - GX0 + 20f), GY0 - 10f + r.nextFloat() * (GY1 - GY0 + 14f), listOf("🌼", "🌷", "🍄", "🌱", "🌸")[r.nextInt(5)]) }
+        List(26) { Triple(GX0 - 10f + r.nextFloat() * (GX1 - GX0 + 20f), GY0 - 10f + r.nextFloat() * (GY1 - GY0 + 14f), r.nextInt(5)) }
             .sortedBy { it.second }
     }
 
@@ -164,6 +171,7 @@ class GameView(context: Context) : View(context) {
     private var bossHint = 0f
     private val boss: Boss? get() = sim.boss
     private var runLevel = 1
+    private var runSkin = 0
     private var shake = 0f
     private var combo = 0
     private var comboT = 0f
@@ -181,7 +189,25 @@ class GameView(context: Context) : View(context) {
     private val pops = ArrayList<Pop>()
 
     // ферма
-    private val pets = ArrayList<Pet>()
+    private val petLists = Array(Farms.COUNT) { ArrayList<Pet>() }
+    private val pets: ArrayList<Pet> get() = petLists[save.activeFarm]
+    private var viewFarm = 0
+    private var dragPtr = -1
+    private var dragIdx = -1
+    private var dragMoved = false
+    private var dragX0 = 0f
+    private var dragY0 = 0f
+    private val hist = FloatArray(18) // 6 точек: x, y, t
+    private var histN = 0
+    private val snowflakes = List(40) { Triple(rnd.nextFloat() * 360f, rnd.nextFloat() * 300f, 0.5f + rnd.nextFloat()) }
+
+    // гардероб и боксы
+    private var boxStage = 0 // 0 нет, 1 трясётся, 2 открыт
+    private var boxT = 0f
+    private var boxKind = 0
+    private var boxSkin = 0
+    private var boxDup = false
+    private var boxFree = false
     private val farmFoods = ArrayList<FarmFood>()
     private val uiPops = ArrayList<Pop>()
 
@@ -215,6 +241,7 @@ class GameView(context: Context) : View(context) {
     /** true — нажатие «назад» обработано внутри игры. */
     fun onBack(): Boolean = when (scene) {
         Scene.PLAY -> { paused = !paused; true }
+        Scene.WARDROBE -> { if (boxStage == 0) goFarm() else boxStage = 0; true }
         Scene.DEAD, Scene.FARM -> { goMenu(); true }
         Scene.MENU -> false
     }
@@ -226,6 +253,7 @@ class GameView(context: Context) : View(context) {
     }
 
     private fun goFarm() {
+        viewFarm = save.activeFarm
         scene = Scene.FARM
         sceneTime = 0f
         paused = false
@@ -263,6 +291,7 @@ class GameView(context: Context) : View(context) {
         when (scene) {
             Scene.MENU -> drawMenu(c)
             Scene.FARM -> drawFarm(c, dt)
+            Scene.WARDROBE -> drawWardrobe(c, dt)
             Scene.PLAY, Scene.DEAD -> {
                 if (scene == Scene.PLAY && !paused) {
                     var rem = dt
@@ -290,7 +319,10 @@ class GameView(context: Context) : View(context) {
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN ->
                 onDown(e.getPointerId(e.actionIndex), e.getX(e.actionIndex), e.getY(e.actionIndex))
-            MotionEvent.ACTION_MOVE -> if (gesturePtr >= 0 && !gestureDone) {
+            MotionEvent.ACTION_MOVE -> if (dragPtr >= 0) {
+                val i = e.findPointerIndex(dragPtr)
+                if (i >= 0) farmMove((e.getX(i) - uiOx) / ui, (e.getY(i) - uiOy) / ui)
+            } else if (gesturePtr >= 0 && !gestureDone) {
                 val i = e.findPointerIndex(gesturePtr)
                 if (i >= 0) {
                     val dx = (e.getX(i) - gestureX0) / scale
@@ -300,12 +332,18 @@ class GameView(context: Context) : View(context) {
                     }
                 }
             }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP ->
-                if (e.getPointerId(e.actionIndex) == gesturePtr) {
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
+                val pid = e.getPointerId(e.actionIndex)
+                if (pid == gesturePtr) {
                     if (!gestureDone) tapRelease()
                     gesturePtr = -1
                 }
-            MotionEvent.ACTION_CANCEL -> gesturePtr = -1
+                if (pid == dragPtr) farmUp()
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                gesturePtr = -1
+                if (dragPtr >= 0) farmUp()
+            }
         }
         return true
     }
@@ -332,7 +370,7 @@ class GameView(context: Context) : View(context) {
             sfx.play(Sfx.S.CLICK)
             hit.onTap()
         } else if (scene == Scene.FARM) {
-            onFarmTap(ux, uy)
+            farmDown(ux, uy, id)
         }
     }
 
@@ -365,6 +403,7 @@ class GameView(context: Context) : View(context) {
         sceneTime = 0f
         paused = false
         runLevel = save.level(save.selected)
+        runSkin = save.skinOf(save.selected)
         sim.reset(runLevel, save.coinMultiplier(), viewH)
         gen.reset()
         gen.fill(sim.camY - 800f)
@@ -487,6 +526,9 @@ class GameView(context: Context) : View(context) {
                 Ev.BOSS_DEAD -> {
                     shake = 0.7f
                     sfx.play(Sfx.S.BOSS_DEAD)
+                    save.freeBoxes++
+                    save.save()
+                    pops.add(Pop(W / 2, sim.camY + viewH * 0.3f + 70f, "🎁 бесплатный бокс со скином!", 0xFFFFFFFF.toInt(), 16f))
                     pops.add(Pop(W / 2, sim.camY + viewH * 0.3f, "ПОБЕДА!", 0xFFFFD54F.toInt(), 34f))
                     pops.add(Pop(W / 2, sim.camY + viewH * 0.3f + 40f, "+" + fmt(sim.coinMul * 150f) + " монет", 0xFFFFE082.toInt(), 18f))
                     for (i in 0 until 40) {
@@ -646,20 +688,66 @@ class GameView(context: Context) : View(context) {
     private fun fmt(v: Float) = if (v == floor(v)) v.toInt().toString() else "%.1f".format(v)
 
     /** Рисует тилкайо с центром в (cx, cy); rad — «радиус пузика». */
+    private val silhouette = ColorMatrixColorFilter(
+        ColorMatrix(floatArrayOf(0f, 0f, 0f, 0f, 22f, 0f, 0f, 0f, 0f, 18f, 0f, 0f, 0f, 0f, 38f, 0f, 0f, 0f, 1f, 0f)),
+    )
+
+    /** Рисует тилкайо с центром в (cx, cy); rad — «радиус пузика». [skin] — номер скина, [hidden] — чёрный силуэт. */
     private fun drawTilcayo(
-        c: Canvas, cx: Float, cy: Float, rad: Float, faceDir: Int, rot: Float,
-        sx: Float, sy: Float, level: Int,
+        c: Canvas, cx: Float, cy0: Float, rad: Float, faceDir: Int, rot: Float,
+        sx: Float, sy: Float, level: Int, skin: Int = 0, hidden: Boolean = false,
     ) {
+        val sk = Skins.all[skin]
         val w = rad * 2.5f
         val h = w * sprite.height / sprite.width
+        val cy = if (sk.fx == Skin.FX_GHOST && !hidden) cy0 - rad * 0.12f + sin(anim * 3f) * rad * 0.1f else cy0
+        if (sk.fx == Skin.FX_FIRE && !hidden) {
+            val fl = 0.85f + 0.2f * sin(anim * 12f)
+            text(c, "🔥", cx - faceDir * w * 0.44f, cy + h * 0.14f, rad * 0.8f * fl, shadow = false)
+            text(c, "🔥", cx + faceDir * w * 0.46f, cy + h * 0.2f, rad * 0.6f * (2f - fl), shadow = false)
+        }
         c.save()
         c.translate(cx, cy)
         c.rotate(rot)
         c.scale(sx * faceDir, sy)
         rect.set(-w / 2, -h / 2, w / 2, h / 2)
+        if (hidden) {
+            bmpPaint.colorFilter = silhouette
+        } else {
+            bmpPaint.colorFilter = Skins.filter(skin, anim)
+            bmpPaint.alpha = (sk.alpha * 255).toInt()
+        }
         c.drawBitmap(sprite, null, rect, bmpPaint)
+        bmpPaint.colorFilter = null
+        bmpPaint.alpha = 255
         c.restore()
-        if (level >= Balance.MAX_LEVEL) text(c, "👑", cx + faceDir * w * 0.02f, cy - h * 0.46f * sy, rad * 0.95f, shadow = false)
+        if (hidden) return
+
+        val crown = level >= Balance.MAX_LEVEL && sk.acc != "👑"
+        if (crown) text(c, "👑", cx + faceDir * w * 0.02f, cy - h * 0.46f * sy, rad * 0.95f, shadow = false)
+        val acc = sk.acc
+        if (acc != null) {
+            if (sk.accOnEyes) {
+                text(c, acc, cx + faceDir * w * 0.1f, cy - h * 0.02f * sy, rad * 0.9f, shadow = false)
+            } else if (crown) {
+                text(c, acc, cx - faceDir * w * 0.3f, cy - h * 0.38f * sy, rad * 0.7f, shadow = false)
+            } else {
+                text(c, acc, cx + faceDir * w * 0.02f, cy - h * 0.46f * sy, rad * 0.95f, shadow = false)
+            }
+        }
+        when (sk.fx) {
+            Skin.FX_SPARK -> for (i in 0 until 3) {
+                val a = anim * 1.7f + i * 2.1f
+                val tw = 0.5f + 0.5f * sin(anim * 5f + i * 2f)
+                text(c, "✨", cx + cos(a) * w * 0.5f, cy + sin(a * 1.3f) * h * 0.42f, rad * (0.35f + 0.35f * tw), shadow = false)
+            }
+            Skin.FX_STARS -> for (i in 0 until 4) {
+                val a = anim * 1.3f + i * 1.57f
+                p.style = Paint.Style.FILL
+                p.color = 0xFFFFFFFF.toInt()
+                c.drawCircle(cx + cos(a) * w * 0.55f, cy + sin(a) * h * 0.2f - h * 0.1f, rad * 0.07f + 0.8f, p)
+            }
+        }
     }
 
     private fun drawParticles(c: Canvas) {
@@ -947,7 +1035,7 @@ class GameView(context: Context) : View(context) {
             val sx = 1f + squash * 0.22f - stretch
             val sy = 1f - squash * 0.22f + stretch
             val faceDir = if (onWall) -side else face
-            drawTilcayo(c, px, py, r, faceDir, rot, sx, sy, runLevel)
+            drawTilcayo(c, px, py, r, faceDir, rot, sx, sy, runLevel, runSkin)
             if (shield > 0f && (shield > 0.8f || (anim * 10f).toInt() % 2 == 0)) {
                 p.style = Paint.Style.FILL
                 p.color = 0x3355CCFF
@@ -1218,11 +1306,11 @@ class GameView(context: Context) : View(context) {
 
         val lvl = save.level(save.selected)
         val bob = sin(anim * 2.5f)
-        drawTilcayo(c, 180f, 380f + bob * 8f, 40f + lvl * 3f, 1, bob * 4f, 1f + bob * 0.03f, 1f - bob * 0.03f, lvl)
+        drawTilcayo(c, 180f, 380f + bob * 8f, 40f + lvl * 3f, 1, bob * 4f, 1f + bob * 0.03f, 1f - bob * 0.03f, lvl, save.skinOf(save.selected))
         text(c, Balance.names[save.selected % Balance.names.size] + " · ур. $lvl", 180f, 470f, 20f, 0xFFFFF3C4.toInt())
 
         btn(c, "▶  ИГРАТЬ", 50f, 520f, 260f, 80f, k(0xFF00C853)) { startRun() }
-        btn(c, "🐾  ФЕРМА", 50f, 618f, 260f, 64f, k(0xFF7C4DFF), sub = if (save.pending() > 0) "ждёт +${save.pending()} 💰" else null) { goFarm() }
+        btn(c, "🐾  ФЕРМА", 50f, 618f, 260f, 64f, k(0xFF7C4DFF), sub = if (save.pending() > 0) "ждёт +${save.pending()} 💰" else if (save.freeBoxes > 0) "🎁 ждёт бесплатный бокс" else null) { goFarm() }
         btn(c, if (save.sound) "🔊" else "🔇", 150f, 706f, 60f, 48f, k(0xFF5C6BC0)) { toggleSound() }
 
         panel(c, 20f, 20f, 120f, 34f, 0x66000000)
@@ -1241,16 +1329,19 @@ class GameView(context: Context) : View(context) {
     private fun petRadius(i: Int, pet: Pet) = (14f + save.level(i) * 2.4f) * depthScale(pet.y)
 
     private fun syncPets() {
+        // при первом заходе расставляем всех по лугу, а новорождённый появляется рядом с родителем
+        val initial = pets.isEmpty()
         while (pets.size < save.herd.size) {
-            val parent = pets.getOrNull(save.selected)
+            val parent = if (initial) null else pets.getOrNull(save.selected)
             val pet = Pet(
-                (parent?.x ?: (GX0 + rnd.nextFloat() * (GX1 - GX0))) + (rnd.nextFloat() - 0.5f) * 30f,
-                (parent?.y ?: (GY0 + rnd.nextFloat() * (GY1 - GY0))) + (rnd.nextFloat() - 0.5f) * 20f,
+                (parent?.x ?: (GX0 + rnd.nextFloat() * (GX1 - GX0))) + (if (parent != null) (rnd.nextFloat() - 0.5f) * 30f else 0f),
+                (parent?.y ?: (GY0 + rnd.nextFloat() * (GY1 - GY0))) + (if (parent != null) (rnd.nextFloat() - 0.5f) * 20f else 0f),
             )
             pet.x = pet.x.coerceIn(GX0, GX1)
             pet.y = pet.y.coerceIn(GY0, GY1)
+            pet.face = if (rnd.nextBoolean()) 1 else -1
             pets.add(pet)
-            hop(pet, 2)
+            if (!initial) hop(pet, 2)
         }
         while (pets.size > save.herd.size) pets.removeAt(pets.size - 1)
     }
@@ -1291,9 +1382,7 @@ class GameView(context: Context) : View(context) {
 
     private fun updatePets(dt: Float) {
         // еда падает
-        val fi = farmFoods.iterator()
-        while (fi.hasNext()) {
-            val f = fi.next()
+        for (f in farmFoods) {
             if (f.z > 0f || f.vz > 0f) {
                 f.vz -= 800f * dt
                 f.z += f.vz * dt
@@ -1302,11 +1391,16 @@ class GameView(context: Context) : View(context) {
         }
         for ((i, pet) in pets.withIndex()) {
             val sp = max(18f, 56f - save.level(i) * 3.5f)
+            pet.squash = max(0f, pet.squash - dt * 4f)
             when (pet.st) {
                 Pet.IDLE -> {
-                    pet.t -= dt
-                    if (pet.t <= 0f) pickNext(pet)
-                    if (farmFoods.any { it.owner === pet }) pickNext(pet)
+                    if (pet.dizzy > 0f) {
+                        pet.dizzy -= dt
+                    } else {
+                        pet.t -= dt
+                        if (pet.t <= 0f) pickNext(pet)
+                        if (farmFoods.any { it.owner === pet }) pickNext(pet)
+                    }
                 }
                 Pet.WALK -> {
                     val food = farmFoods.filter { it.owner === pet }.minByOrNull { hypot(it.x - pet.x, it.y - pet.y) }
@@ -1353,58 +1447,195 @@ class GameView(context: Context) : View(context) {
                     pet.t -= dt
                     if (pet.t <= 0f) { pet.st = Pet.IDLE; pet.t = 0.3f }
                 }
+                Pet.DRAG -> {
+                    // позицию задаёт палец; крен — по скорости движения
+                    pet.spin += (pet.gvx * 0.04f - pet.spin) * min(1f, dt * 8f)
+                }
+                Pet.FLY -> {
+                    pet.vz -= 700f * dt
+                    pet.z += pet.vz * dt
+                    pet.x += pet.gvx * dt
+                    pet.y += pet.gvy * dt
+                    pet.spin += pet.spinV * dt
+                    // отскок от забора и краёв луга
+                    if (pet.x < GX0) { pet.x = GX0; pet.gvx = abs(pet.gvx) * 0.6f; pet.spinV *= -0.6f }
+                    if (pet.x > GX1) { pet.x = GX1; pet.gvx = -abs(pet.gvx) * 0.6f; pet.spinV *= -0.6f }
+                    if (pet.y < GY0) { pet.y = GY0; pet.gvy = abs(pet.gvy) * 0.5f }
+                    if (pet.y > GY1) { pet.y = GY1; pet.gvy = -abs(pet.gvy) * 0.5f }
+                    if (abs(pet.gvx) > 6f) pet.face = if (pet.gvx > 0f) 1 else -1
+                    if (pet.z <= 0f) {
+                        pet.z = 0f
+                        if (pet.vz < -110f) {
+                            pet.vz = -pet.vz * 0.42f
+                            pet.gvx *= 0.7f
+                            pet.gvy *= 0.7f
+                            pet.spinV *= 0.55f
+                            pet.squash = 1f
+                            sfx.play(Sfx.S.LAND, 0.8f + rnd.nextFloat() * 0.3f, 0.8f)
+                        } else {
+                            pet.vz = 0f
+                            val fr = max(0f, 1f - 5f * dt)
+                            pet.gvx *= fr
+                            pet.gvy *= fr
+                            pet.spinV *= fr
+                            pet.spin += (0f - pet.spin) * min(1f, dt * 8f)
+                            if (hypot(pet.gvx, pet.gvy) < 14f) {
+                                pet.st = Pet.IDLE
+                                pet.t = 0.6f
+                                pet.spin = 0f
+                                pet.spinV = 0f
+                                pet.gvx = 0f
+                                pet.gvy = 0f
+                            }
+                        }
+                    }
+                }
             }
-            pet.x = pet.x.coerceIn(GX0, GX1)
+            pet.x = pet.x.coerceIn(GX0 - 12f, GX1 + 12f)
             pet.y = pet.y.coerceIn(GY0, GY1)
         }
     }
 
-    private fun onFarmTap(ux: Float, uy: Float) {
-        if (uy < 250f || uy > 515f) return
-        // верхний (ближайший к зрителю) тилкайо под пальцем
+    /** Какой тилкайо под пальцем (самый «передний»), либо -1. */
+    private fun petAt(ux: Float, uy: Float): Int {
         var best = -1
         var bestY = -1f
         for ((i, pet) in pets.withIndex()) {
             val rad = petRadius(i, pet)
             val cy = pet.y - rad * 1.1f - pet.z
-            if (abs(ux - pet.x) < rad * 1.2f && uy > cy - rad * 1.2f && uy < pet.y + 6f && pet.y > bestY) {
+            if (abs(ux - pet.x) < rad * 1.25f && uy > cy - rad * 1.25f && uy < cy + rad * 1.2f && pet.y > bestY) {
                 best = i
                 bestY = pet.y
             }
         }
-        if (best >= 0) {
-            save.selected = best
+        return best
+    }
+
+    private fun farmDown(ux: Float, uy: Float, id: Int) {
+        if (viewFarm >= save.unlocked) return
+        val i = petAt(ux, uy)
+        if (i < 0) return
+        dragPtr = id
+        dragIdx = i
+        dragMoved = false
+        dragX0 = ux
+        dragY0 = uy
+        histN = 0
+    }
+
+    private fun pushHist(ux: Float, uy: Float) {
+        val tms = (System.nanoTime() / 1_000_000L).toFloat()
+        if (histN == 6) {
+            for (j in 0 until 15) hist[j] = hist[j + 3]
+            histN = 5
+        }
+        hist[histN * 3] = ux; hist[histN * 3 + 1] = uy; hist[histN * 3 + 2] = tms
+        histN++
+    }
+
+    private fun farmMove(ux: Float, uy: Float) {
+        if (dragIdx < 0 || dragIdx >= pets.size) return
+        val pet = pets[dragIdx]
+        if (!dragMoved && hypot(ux - dragX0, uy - dragY0) > 10f) {
+            dragMoved = true
+            pet.st = Pet.DRAG
+            pet.vz = 0f
+            pet.spin = 0f
+            pet.spinV = 0f
+            save.selected = dragIdx
             save.save()
-            val pet = pets[best]
+            sfx.play(Sfx.S.HOP, 1.4f, 0.6f)
+        }
+        if (!dragMoved) return
+        val rad = petRadius(dragIdx, pet)
+        val gy = (uy + rad * 1.1f + 24f).coerceIn(GY0, GY1)
+        pet.gvx = (ux - pet.x) * 3f
+        pet.x = ux.coerceIn(GX0 - 12f, GX1 + 12f)
+        pet.y = gy
+        pet.z = max(24f, gy - rad * 1.1f - uy)
+        if (abs(pet.gvx) > 20f) pet.face = if (pet.gvx > 0f) 1 else -1
+        pushHist(ux, uy)
+    }
+
+    private fun farmUp() {
+        val idx = dragIdx
+        dragPtr = -1
+        dragIdx = -1
+        if (idx < 0 || idx >= pets.size) return
+        val pet = pets[idx]
+        if (!dragMoved) {
+            // обычный тап: выбрать и подпрыгнуть
+            save.selected = idx
+            save.save()
             if (pet.st != Pet.HOP && pet.st != Pet.FLIP) { if (rnd.nextInt(3) == 0) flip(pet) else hop(pet, 2) }
             sfx.play(Sfx.S.HOP, 1.1f, 0.6f)
-            uiPops.add(Pop(pet.x, pet.y - petRadius(best, pet) * 2.4f, "💛", 0xFFFFFFFF.toInt(), 22f))
+            uiPops.add(Pop(pet.x, pet.y - petRadius(idx, pet) * 2.4f, "💛", 0xFFFFFFFF.toInt(), 22f))
+            return
+        }
+        // бросок: скорость пальца за последние ~100 мс
+        var vx = 0f
+        var vy = 0f
+        if (histN >= 2) {
+            val tNow = hist[(histN - 1) * 3 + 2]
+            var j = histN - 2
+            while (j > 0 && tNow - hist[j * 3 + 2] < 100f) j--
+            val dtMs = tNow - hist[j * 3 + 2]
+            if (dtMs > 15f && (System.nanoTime() / 1_000_000L).toFloat() - tNow < 120f) {
+                vx = (hist[(histN - 1) * 3] - hist[j * 3]) / dtMs * 1000f
+                vy = (hist[(histN - 1) * 3 + 1] - hist[j * 3 + 1]) / dtMs * 1000f
+            }
+        }
+        val speed = hypot(vx, vy)
+        pet.st = Pet.FLY
+        if (speed < 60f) {
+            pet.gvx = 0f; pet.gvy = 0f; pet.vz = 0f; pet.spinV = 0f
+        } else {
+            pet.gvx = (vx * 0.85f).coerceIn(-650f, 650f)
+            pet.gvy = (vy * 0.4f).coerceIn(-260f, 260f)
+            pet.vz = (-vy * 0.7f + 30f).coerceIn(-200f, 620f)
+            pet.spinV = (vx * 0.9f).coerceIn(-900f, 900f)
+            if (speed > 700f) pet.dizzy = 1.6f
+            sfx.play(Sfx.S.THROW, 0.8f + min(0.8f, speed / 1200f), 0.6f)
         }
     }
 
-    private fun drawFarm(c: Canvas, dt: Float) {
-        syncPets()
-        updatePets(dt)
-        stepFx(dt)
-        drawBackground(c, k(0xFF4FB3F6), k(0xFFD9F3FF), 0f, withStars = false)
-        c.save()
-        c.translate(uiOx, uiOy)
-        c.scale(ui, ui)
-        val ox = -uiOx / ui - 4f
-        val ow = 368f + 2 * uiOx / ui
+    private fun goWardrobe() {
+        scene = Scene.WARDROBE
+        sceneTime = 0f
+        boxStage = 0
+    }
 
-        // солнце и облака
+    private fun selectFarm(i: Int) {
+        viewFarm = i
+        if (i < save.unlocked && save.activeFarm != i) {
+            save.activeFarm = i
+            save.save()
+            farmFoods.clear()
+            dragIdx = -1
+            dragPtr = -1
+        }
+    }
+
+    // ---------- рисование фермы ----------
+
+    private fun drawFarmScenery(c: Canvas, th: FarmTheme, ox: Float, ow: Float) {
         p.style = Paint.Style.FILL
-        p.color = 0x55FFF59D
-        c.drawCircle(300f, 165f, 44f, p)
-        p.color = k(0xFFFFEB3B)
-        c.drawCircle(300f, 165f, 30f, p)
-        for (i in 0 until 3) {
-            val cx = ((anim * (6f + i * 3f) + i * 140f) % 480f) - 60f
-            val cy = 150f + i * 26f
-            p.color = 0xCCFFFFFF.toInt()
-            c.drawCircle(cx, cy, 15f, p); c.drawCircle(cx + 16f, cy - 8f, 19f, p)
-            c.drawCircle(cx + 36f, cy, 15f, p); c.drawRect(cx, cy, cx + 36f, cy + 15f, p)
+        // солнце / Земля
+        when (th.sun) {
+            0 -> { p.color = 0x55FFF59D; c.drawCircle(300f, 165f, 44f, p); p.color = k(0xFFFFEB3B); c.drawCircle(300f, 165f, 30f, p) }
+            1 -> { p.color = 0x55FFB74D; c.drawCircle(290f, 175f, 56f, p); p.color = k(0xFFFF9800); c.drawCircle(290f, 175f, 38f, p) }
+            2 -> { p.color = 0x44FFFFFF; c.drawCircle(300f, 165f, 40f, p); p.color = k(0xFFFFF8E1); c.drawCircle(300f, 165f, 26f, p) }
+            else -> text(c, "🌍", 296f, 190f, 70f, shadow = false)
+        }
+        // облака
+        if (!th.stars) {
+            for (i in 0 until 3) {
+                val cx = ((anim * (6f + i * 3f) + i * 140f) % 480f) - 60f
+                val cy = 150f + i * 26f
+                p.color = if (th.sun == 1) 0xAAFFF3E0.toInt() else 0xCCFFFFFF.toInt()
+                c.drawCircle(cx, cy, 15f, p); c.drawCircle(cx + 16f, cy - 8f, 19f, p)
+                c.drawCircle(cx + 36f, cy, 15f, p); c.drawRect(cx, cy, cx + 36f, cy + 15f, p)
+            }
         }
         // холмы
         for (layer in 0..1) {
@@ -1418,14 +1649,14 @@ class GameView(context: Context) : View(context) {
             }
             path.lineTo(ox + ow, 320f)
             path.close()
-            p.color = if (layer == 0) k(0xFF8BD17F) else k(0xFF6CC067)
+            p.color = if (layer == 0) th.hillA else th.hillB
             c.drawPath(path, p)
         }
-        text(c, "🌳", 28f, 258f, 56f, shadow = false)
-        text(c, "🌳", 334f, 254f, 48f, shadow = false)
+        text(c, th.props, 28f, 258f, 56f, shadow = false)
+        text(c, th.props, 334f, 254f, 48f, shadow = false)
 
         // луг с полосами
-        p.color = k(0xFF5DBB57)
+        p.color = th.ground
         c.drawRect(ox, 252f, ox + ow, 515f, p)
         var by = 252f
         var bhh = 12f
@@ -1437,69 +1668,110 @@ class GameView(context: Context) : View(context) {
         // забор
         var fx = ox
         while (fx < ox + ow) {
-            p.color = k(0xFFD9A760)
+            p.color = th.fence
             c.drawRoundRect(fx, 246f, fx + 8f, 276f, 3f, 3f, p)
-            p.color = k(0xFFB98544)
+            p.color = th.fenceDark
             c.drawRect(fx + 5f, 248f, fx + 8f, 276f, p)
             fx += 38f
         }
-        p.color = k(0xFFE8BC78)
+        p.color = th.fence
         c.drawRect(ox, 254f, ox + ow, 260f, p)
         c.drawRect(ox, 266f, ox + ow, 272f, p)
-        // цветочки
-        for (d in decor) text(c, d.third, d.first, d.second, 13f, shadow = false)
+        // украшения
+        for (d in decor) text(c, th.decor[d.third % th.decor.size], d.first, d.second, 13f, shadow = false)
+    }
 
-        // еда на земле
-        for (f in farmFoods) {
-            p.color = 0x33000000
-            rect.set(f.x - 9f, f.y - 3f, f.x + 9f, f.y + 3f)
-            c.drawOval(rect, p)
-            text(c, f.emoji, f.x, f.y - 4f - f.z, 20f, shadow = false)
+    private fun drawFarm(c: Canvas, dt: Float) {
+        val ti = viewFarm.coerceIn(0, Farms.COUNT - 1)
+        val th = Farms.all[ti]
+        val locked = ti >= save.unlocked
+        if (!locked) {
+            if (save.activeFarm != ti) selectFarm(ti)
+            syncPets()
+            updatePets(dt)
         }
+        stepFx(dt)
+        drawBackground(c, th.skyTop, th.skyBot, 0f, withStars = th.stars)
+        c.save()
+        c.translate(uiOx, uiOy)
+        c.scale(ui, ui)
+        val ox = -uiOx / ui - 4f
+        val ow = 368f + 2 * uiOx / ui
 
-        // тилкайо, отсортированные по глубине
-        val order = pets.indices.sortedBy { pets[it].y }
-        for (i in order) {
-            val pet = pets[i]
-            val lvl = save.level(i)
-            val rad = petRadius(i, pet)
-            val sel = i == save.selected
-            // тень
-            val sh = 1f / (1f + pet.z / 90f)
-            p.style = Paint.Style.FILL
-            p.color = ((0x40 * sh).toInt() shl 24)
-            rect.set(pet.x - rad * 1.15f * sh, pet.y - rad * 0.2f, pet.x + rad * 1.15f * sh, pet.y + rad * 0.2f)
-            c.drawOval(rect, p)
-            if (sel) {
-                p.style = Paint.Style.STROKE
-                p.strokeWidth = 2.5f
-                p.color = k(0xFFFFD54F)
-                val pulse = 1f + 0.06f * sin(anim * 5f)
-                rect.set(pet.x - rad * 1.35f * pulse, pet.y - rad * 0.3f * pulse, pet.x + rad * 1.35f * pulse, pet.y + rad * 0.3f * pulse)
+        drawFarmScenery(c, th, ox, ow)
+
+        if (!locked) {
+            // еда на земле
+            for (f in farmFoods) {
+                p.color = 0x33000000
+                rect.set(f.x - 9f, f.y - 3f, f.x + 9f, f.y + 3f)
                 c.drawOval(rect, p)
+                text(c, f.emoji, f.x, f.y - 4f - f.z, 20f, shadow = false)
+            }
+
+            // тилкайо, отсортированные по глубине; несомый — всегда сверху
+            val order = pets.indices.sortedBy { if (pets[it].st == Pet.DRAG) 10000f else pets[it].y }
+            for (i in order) {
+                val pet = pets[i]
+                val lvl = save.level(i)
+                val rad = petRadius(i, pet)
+                val sel = i == save.selected
+                // тень
+                val sh = 1f / (1f + pet.z / 90f)
                 p.style = Paint.Style.FILL
+                p.color = ((0x40 * sh).toInt() shl 24)
+                rect.set(pet.x - rad * 1.15f * sh, pet.y - rad * 0.2f, pet.x + rad * 1.15f * sh, pet.y + rad * 0.2f)
+                c.drawOval(rect, p)
+                if (sel) {
+                    p.style = Paint.Style.STROKE
+                    p.strokeWidth = 2.5f
+                    p.color = k(0xFFFFD54F)
+                    val pulse = 1f + 0.06f * sin(anim * 5f)
+                    rect.set(pet.x - rad * 1.35f * pulse, pet.y - rad * 0.3f * pulse, pet.x + rad * 1.35f * pulse, pet.y + rad * 0.3f * pulse)
+                    c.drawOval(rect, p)
+                    p.style = Paint.Style.FILL
+                }
+                var rot = 0f
+                var sx = 1f + 0.02f * sin(anim * 2f + i)
+                var sy = 1f - 0.02f * sin(anim * 2f + i)
+                var bounce = 0f
+                when (pet.st) {
+                    Pet.WALK -> { rot = sin(pet.ph * 2f * PI.toFloat()) * 6f; bounce = abs(sin(pet.ph * 2f * PI.toFloat())) * 2.5f }
+                    Pet.FLIP -> rot = pet.spin * pet.face
+                    Pet.EAT -> { sy = 1f - 0.08f * abs(sin(pet.t * 20f)); sx = 1f + 0.05f * abs(sin(pet.t * 20f)) }
+                    Pet.HOP -> { val st = (pet.vz / 200f).coerceIn(-0.2f, 0.2f); sx = 1f - st * 0.4f; sy = 1f + st * 0.5f }
+                    Pet.DRAG -> { rot = pet.spin.coerceIn(-25f, 25f); sy = 1.08f; sx = 0.94f }
+                    Pet.FLY -> rot = pet.spin
+                    Pet.IDLE -> if (pet.dizzy > 0f) rot = sin(anim * 14f) * 8f
+                }
+                if (pet.squash > 0f) { sy *= 1f - 0.22f * pet.squash; sx *= 1f + 0.16f * pet.squash }
+                val cy = pet.y - rad * 1.1f - pet.z - bounce
+                drawTilcayo(c, pet.x, cy, rad, pet.face, rot, sx, sy, lvl, save.skinOf(i))
+                if (pet.dizzy > 0f && pet.st != Pet.DRAG) text(c, "💫", pet.x, cy - rad * 1.5f, 20f, shadow = false)
+                if (pet.st == Pet.DRAG) {
+                    text(c, "🤏", pet.x, cy - rad * 1.45f, 16f, shadow = false)
+                } else if (sel) {
+                    text(c, "⭐ ${Balance.names[i % Balance.names.size]} · ур.$lvl", pet.x, cy - rad * 1.55f, 12f, 0xFFFFF3C4.toInt(), maxW = 110f)
+                } else {
+                    text(c, "ур.$lvl", pet.x, cy - rad * 1.25f, 10f, 0xCCFFFFFF.toInt())
+                }
             }
-            var rot = 0f
-            var sx = 1f + 0.02f * sin(anim * 2f + i)
-            var sy = 1f - 0.02f * sin(anim * 2f + i)
-            var bounce = 0f
-            when (pet.st) {
-                Pet.WALK -> { rot = sin(pet.ph * 2f * PI.toFloat()) * 6f; bounce = abs(sin(pet.ph * 2f * PI.toFloat())) * 2.5f }
-                Pet.FLIP -> rot = pet.spin * pet.face
-                Pet.EAT -> { sy = 1f - 0.08f * abs(sin(pet.t * 20f)); sx = 1f + 0.05f * abs(sin(pet.t * 20f)) }
-                Pet.HOP -> { val st = (pet.vz / 200f).coerceIn(-0.2f, 0.2f); sx = 1f - st * 0.4f; sy = 1f + st * 0.5f }
-            }
-            val cy = pet.y - rad * 1.1f - pet.z - bounce
-            drawTilcayo(c, pet.x, cy, rad, pet.face, rot, sx, sy, lvl)
-            if (sel) {
-                text(c, "⭐ ${Balance.names[i % Balance.names.size]} · ур.$lvl", pet.x, cy - rad * 1.55f, 12f, 0xFFFFF3C4.toInt(), maxW = 110f)
-            } else {
-                text(c, "ур.$lvl", pet.x, cy - rad * 1.25f, 10f, 0xCCFFFFFF.toInt())
+            drawParticles(c)
+        }
+
+        // снегопад
+        if (th.snow) {
+            p.style = Paint.Style.FILL
+            p.color = 0xCCFFFFFF.toInt()
+            for ((i, f) in snowflakes.withIndex()) {
+                val y = (f.second + anim * 28f * f.third) % 520f
+                val x = f.first + sin(anim * 1.2f + i) * 8f
+                c.drawCircle(x, y, 1.2f + f.third, p)
             }
         }
-        drawParticles(c)
 
         // нижняя панель
+        p.style = Paint.Style.FILL
         p.color = k(0xFF3B2A1C)
         c.drawRect(ox, 512f, ox + ow, 800f + uiOy / ui + 4f, p)
         p.color = k(0xFF5C4129)
@@ -1507,7 +1779,7 @@ class GameView(context: Context) : View(context) {
 
         // шапка
         btn(c, "◀", 10f, 14f, 52f, 44f, k(0xFF5C6BC0)) { goMenu() }
-        text(c, "ФЕРМА", 180f, 48f, 32f)
+        text(c, "ФЕРМА · ${th.name.uppercase()}", 154f, 48f, 26f, maxW = 176f)
         panel(c, 250f, 18f, 100f, 36f, 0x66000000)
         text(c, "💰 ${save.coins}", 258f, 44f, 20f, 0xFFFFE082.toInt(), Paint.Align.LEFT, maxW = 86f)
 
@@ -1523,14 +1795,71 @@ class GameView(context: Context) : View(context) {
         }
         if (pend > 0) text(c, "+$pend", 270f, 70f, 13f, 0xFFFFE082.toInt())
 
-        // выбранный
+        // вкладки ферм и гардероб
+        for (i in 0 until Farms.COUNT) {
+            val isLocked = i >= save.unlocked
+            val label = if (isLocked) "🔒" else Farms.all[i].emoji
+            val col = if (i == ti) k(0xFF00C853) else if (isLocked) k(0xFF55556A) else k(0xFF5C6BC0)
+            btn(c, label, 8f + i * 67f, 128f, 62f, 34f, col) { selectFarm(i) }
+        }
+        btn(c, "👗 Скины", 278f, 128f, 74f, 34f, k(0xFFE91E63), sub = null) { goWardrobe() }
+        if (save.freeBoxes > 0) text(c, "🎁${save.freeBoxes}", 346f, 128f, 14f, shadow = true)
+
+        if (locked) {
+            drawLockedFarm(c, ti, th)
+            btn(c, "▶  В ЗАБЕГ", 8f, 708f, 344f, 70f, k(0xFF00C853)) { startRun() }
+        } else {
+            drawFarmControls(c)
+        }
+
+        // всплывашки
+        for (q in uiPops) {
+            val a = q.life.coerceIn(0f, 1f)
+            text(c, q.text, q.x, q.y - (1f - q.life) * 50f, q.size, (q.color and 0x00FFFFFF) or ((a * 255).toInt() shl 24))
+        }
+        if (toastT > 0f) {
+            val a = min(1f, toastT * 3f)
+            panel(c, 40f, 190f, 280f, 34f, ((a * 200).toInt() shl 24), 17f)
+            text(c, toastText, 180f, 213f, 17f, ((a * 255).toInt() shl 24) or 0xFFFFFF, maxW = 260f)
+        }
+        c.restore()
+    }
+
+    private fun drawLockedFarm(c: Canvas, ti: Int, th: FarmTheme) {
+        p.style = Paint.Style.FILL
+        p.color = 0x99000000.toInt()
+        c.drawRect(-200f, 252f, 560f, 512f, p)
+        panel(c, 30f, 290f, 300f, 200f, 0xEE231A3D.toInt(), 22f)
+        text(c, "🔒 ${th.emoji} ${th.name}", 180f, 330f, 26f, maxW = 270f)
+        text(c, "Доход фермы: x${fmt(th.incomeMul)}", 180f, 356f, 15f, 0xFFFFF3C4.toInt())
+        text(c, "Свои тилкайо и свои скины", 180f, 376f, 12f, 0xAAFFFFFF.toInt())
+        if (ti == save.unlocked) {
+            btn(c, "ОТКРЫТЬ ЗА ${th.unlockCost} 💰", 50f, 396f, 260f, 62f, k(0xFFFFA000), enabled = save.coins >= th.unlockCost) {
+                if (save.unlockFarm()) {
+                    viewFarm = save.activeFarm
+                    farmFoods.clear()
+                    sfx.play(Sfx.S.LEVEL)
+                    toast("Ферма «${th.name}» открыта! 🎉")
+                    for (n in 0 until 30) {
+                        val a = rnd.nextFloat() * 2f * PI.toFloat()
+                        val sp = 60f + rnd.nextFloat() * 160f
+                        particles.add(Particle(180f, 380f, cos(a) * sp, sin(a) * sp - 100f, 1f, 1f, blockColors[n % 5], 3f + rnd.nextFloat() * 3f))
+                    }
+                } else toast("Не хватает монет: нужно ${th.unlockCost}")
+            }
+        } else {
+            text(c, "Сначала открой «${Farms.all[save.unlocked].name}»", 180f, 430f, 15f, 0xFFFF8A80.toInt(), maxW = 270f)
+        }
+    }
+
+    private fun drawFarmControls(c: Canvas) {
         val sel = save.selected
         val lvl = save.level(sel)
         val name = Balance.names[sel % Balance.names.size]
         text(c, "$name — бегун в забеге, ур. $lvl", 180f, 536f, 16f, 0xFFFFFFFF.toInt(), maxW = 340f)
         val cur = save.herd[sel]
-        val info = if (lvl < Balance.MAX_LEVEL) "жир $cur / ${Balance.fatFor(lvl + 1)} до ур.${lvl + 1} · тапни тилкайо, чтобы выбрать"
-        else "максимальный уровень 👑 · тапни тилкайо, чтобы выбрать"
+        val info = if (lvl < Balance.MAX_LEVEL) "жир $cur / ${Balance.fatFor(lvl + 1)} до ур.${lvl + 1} · тапни — выбрать, потяни — кинуть"
+        else "максимальный уровень 👑 · тапни — выбрать, потяни — кинуть"
         text(c, info, 180f, 552f, 11f, 0xAAFFFFFF.toInt(), maxW = 340f)
 
         // еда
@@ -1560,18 +1889,6 @@ class GameView(context: Context) : View(context) {
             enabled = !preg && canBreed && lvl >= req && save.coins >= cost) { breed() }
 
         btn(c, "▶  В ЗАБЕГ", 8f, 708f, 344f, 70f, k(0xFF00C853)) { startRun() }
-
-        // всплывашки
-        for (q in uiPops) {
-            val a = q.life.coerceIn(0f, 1f)
-            text(c, q.text, q.x, q.y - (1f - q.life) * 50f, q.size, (q.color and 0x00FFFFFF) or ((a * 255).toInt() shl 24))
-        }
-        if (toastT > 0f) {
-            val a = min(1f, toastT * 3f)
-            panel(c, 40f, 190f, 280f, 34f, ((a * 200).toInt() shl 24), 17f)
-            text(c, toastText, 180f, 213f, 17f, ((a * 255).toInt() shl 24) or 0xFFFFFF, maxW = 260f)
-        }
-        c.restore()
     }
 
     private fun feed(f: FoodItem) {
@@ -1621,5 +1938,187 @@ class GameView(context: Context) : View(context) {
         toast("Малыш родится через ${Balance.breedMs(n) / 60000} мин 💕")
         val par = pets.getOrNull(save.selected)
         if (par != null) uiPops.add(Pop(par.x, par.y - 70f, "💕", 0xFFF48FB1.toInt(), 30f))
+    }
+
+    // =====================================================================
+    // Гардероб: боксы со скинами и примерочная
+    // =====================================================================
+
+    private fun buyBox(kind: Int, free: Boolean) {
+        if (boxStage != 0) return
+        val bt = Boxes.all[kind]
+        if (free) {
+            if (save.freeBoxes <= 0) return
+            save.freeBoxes--
+        } else {
+            if (save.coins < bt.price) return toast("Не хватает монет: нужно ${bt.price}")
+            save.coins -= bt.price
+        }
+        boxKind = kind
+        boxFree = free
+        boxSkin = Boxes.roll(bt, rnd)
+        boxDup = save.giveSkin(boxSkin)
+        save.save()
+        boxStage = 1
+        boxT = 0f
+        sfx.play(Sfx.S.BOX)
+    }
+
+    private fun drawWardrobe(c: Canvas, dt: Float) {
+        stepFx(dt)
+        drawBackground(c, k(0xFF2A1055), k(0xFF7B2FA0), anim * 20f)
+        c.save()
+        c.translate(uiOx, uiOy)
+        c.scale(ui, ui)
+
+        btn(c, "◀", 10f, 14f, 52f, 44f, k(0xFF5C6BC0)) { if (boxStage == 0) goFarm() }
+        text(c, "ГАРДЕРОБ", 154f, 48f, 30f, maxW = 176f)
+        panel(c, 250f, 18f, 100f, 36f, 0x66000000)
+        text(c, "💰 ${save.coins}", 258f, 44f, 20f, 0xFFFFE082.toInt(), Paint.Align.LEFT, maxW = 86f)
+
+        // боксы
+        for ((i, bt) in Boxes.all.withIndex()) {
+            val x = 8f + i * 118f
+            val y = 68f
+            panel(c, x, y, 110f, 146f, 0x55000000)
+            val wob = sin(anim * 3f + i) * 4f
+            c.save()
+            c.translate(x + 55f, y + 46f)
+            c.rotate(wob)
+            text(c, bt.emoji, 0f, 14f, 46f, shadow = false)
+            c.restore()
+            text(c, bt.name, x + 55f, y + 70f, 12f, maxW = 100f)
+            text(c, "Ред ${bt.odds[1]}% · Эп ${bt.odds[2]}%", x + 55f, y + 83f, 9f, 0xCCFFFFFF.toInt(), maxW = 100f)
+            text(c, "Легенд. ${bt.odds[3]}%", x + 55f, y + 94f, 9f, 0xFFFFD54F.toInt(), maxW = 100f)
+            if (i == 0 && save.freeBoxes > 0) {
+                btn(c, "🎁 БЕСПЛАТНО", x + 6f, y + 102f, 98f, 38f, k(0xFF00C853), sub = "осталось ${save.freeBoxes}") { buyBox(0, true) }
+            } else {
+                btn(c, "${bt.price} 💰", x + 6f, y + 102f, 98f, 38f, k(0xFFFFA000), enabled = save.coins >= bt.price) { buyBox(i, false) }
+            }
+        }
+
+        // сетка скинов
+        val sel = save.selected
+        val wearing = save.skinOf(sel)
+        text(c, "Надеть на: ${Balance.names[sel % Balance.names.size]} (ур.${save.level(sel)})", 180f, 238f, 15f, 0xFFFFF3C4.toInt(), maxW = 340f)
+        val cw = 84f
+        val ch = 98f
+        for ((i, sk) in Skins.all.withIndex()) {
+            val col = i % 4
+            val row = i / 4
+            val x = 3f + col * (cw + 6f)
+            val y = 248f + row * (ch + 6f)
+            val owned = save.ownsSkin(i)
+            val rc = Rarity.colors[sk.rarity]
+            panel(c, x, y, cw, ch, if (owned) 0x66000000 else 0x44000000, 12f)
+            p.style = Paint.Style.STROKE
+            p.strokeWidth = if (i == wearing) 3.5f else 2f
+            p.color = if (i == wearing) k(0xFFFFFFFF) else (rc and 0x00FFFFFF) or (if (owned) 0xFF000000.toInt() else 0x55000000)
+            c.drawRoundRect(x, y, x + cw, y + ch, 12f, 12f, p)
+            p.style = Paint.Style.FILL
+            drawTilcayo(c, x + cw / 2, y + 40f, 22f, 1, 0f, 1f, 1f, 1, i, hidden = !owned)
+            if (owned) {
+                text(c, sk.name, x + cw / 2, y + 79f, 10f, 0xFFFFFFFF.toInt(), maxW = cw - 6f)
+                if (i == wearing) text(c, "✔", x + cw - 12f, y + 16f, 14f, 0xFF00E676.toInt())
+            } else {
+                text(c, "?", x + cw / 2, y + 48f, 26f, 0x88FFFFFF.toInt(), shadow = false)
+                text(c, "???", x + cw / 2, y + 79f, 10f, 0x88FFFFFF.toInt())
+            }
+            text(c, Rarity.names[sk.rarity], x + cw / 2, y + 92f, 8f, rc, maxW = cw - 6f)
+            buttons.add(Btn(x, y, cw, ch) {
+                if (boxStage != 0) return@Btn
+                if (owned) {
+                    save.setSkin(sel, i)
+                    save.save()
+                    sfx.play(Sfx.S.BUY)
+                    toast("Надет скин «${sk.name}»")
+                } else {
+                    toast("Скин пока не выпал — открывай боксы!")
+                }
+            })
+        }
+        text(c, "Скинов собрано: ${Skins.all.indices.count { save.ownsSkin(it) }} / ${Skins.all.size}", 180f, 756f, 13f, 0xAAFFFFFF.toInt())
+        btn(c, "▶  К ФЕРМЕ", 100f, 764f, 160f, 30f, k(0xFF00C853)) { if (boxStage == 0) goFarm() }
+
+        if (toastT > 0f && boxStage == 0) {
+            val a = min(1f, toastT * 3f)
+            panel(c, 40f, 222f, 280f, 30f, ((a * 200).toInt() shl 24), 15f)
+            text(c, toastText, 180f, 243f, 15f, ((a * 255).toInt() shl 24) or 0xFFFFFF, maxW = 260f)
+        }
+
+        if (boxStage != 0) drawBoxOverlay(c, dt)
+        c.restore()
+    }
+
+    private fun drawBoxOverlay(c: Canvas, dt: Float) {
+        boxT += dt
+        // перехватываем нажатия под оверлеем
+        buttons.add(Btn(-300f, -300f, 1000f, 1600f) {})
+        p.style = Paint.Style.FILL
+        p.color = 0xCC000000.toInt()
+        c.drawRect(-300f, -300f, 700f, 1300f, p)
+        val bt = Boxes.all[boxKind]
+        val sk = Skins.all[boxSkin]
+        val rc = Rarity.colors[sk.rarity]
+
+        if (boxStage == 1) {
+            val k1 = (boxT / 1.8f).coerceIn(0f, 1f)
+            c.save()
+            c.translate(180f, 330f)
+            c.rotate(sin(boxT * (18f + boxT * 30f)) * (4f + k1 * 14f))
+            val s = 1f + 0.18f * k1 + 0.04f * sin(boxT * 40f)
+            c.scale(s, s)
+            text(c, bt.emoji, 0f, 40f, 130f, shadow = false)
+            c.restore()
+            text(c, "Что же внутри…", 180f, 520f, 20f, 0xCCFFFFFF.toInt())
+            if (boxT >= 1.8f) {
+                boxStage = 2
+                boxT = 0f
+                sfx.play(when (sk.rarity) { 0 -> Sfx.S.REVEAL_C; 1 -> Sfx.S.REVEAL_R; 2 -> Sfx.S.REVEAL_E; else -> Sfx.S.REVEAL_L })
+                performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                val n = 20 + sk.rarity * 20
+                for (j in 0 until n) {
+                    val a = rnd.nextFloat() * 2f * PI.toFloat()
+                    val sp = 80f + rnd.nextFloat() * (200f + sk.rarity * 80f)
+                    particles.add(Particle(180f, 330f, cos(a) * sp, sin(a) * sp - 60f, 1.4f, 1.4f, if (j % 2 == 0) rc else 0xFFFFFFFF.toInt(), 3f + rnd.nextFloat() * 4f))
+                }
+            }
+        } else {
+            // свечение редкости
+            val pulse = 1f + 0.05f * sin(boxT * 4f)
+            for (j in 5 downTo 1) {
+                p.color = (rc and 0x00FFFFFF) or ((0x18 + (5 - j) * 0x0C) shl 24)
+                c.drawCircle(180f, 330f, (60f + j * 22f) * pulse, p)
+            }
+            val flash = (1f - boxT * 3f).coerceIn(0f, 1f)
+            val pop = min(1f, boxT * 4f)
+            val bob = sin(boxT * 3f)
+            drawTilcayo(c, 180f, 330f + bob * 5f, 78f * (0.4f + 0.6f * pop), 1, bob * 3f, 1f, 1f, 1, boxSkin)
+            text(c, Rarity.names[sk.rarity].uppercase(), 180f, 468f, 22f, rc, maxW = 300f)
+            text(c, sk.name, 180f, 500f, 30f, maxW = 320f)
+            if (boxDup) {
+                text(c, "Уже есть! Вернули +${Rarity.refund[sk.rarity]} 💰", 180f, 532f, 16f, 0xFFFFE082.toInt(), maxW = 320f)
+            } else {
+                text(c, "✨ НОВЫЙ СКИН! ✨", 180f, 532f, 18f, 0xFF00E676.toInt())
+            }
+            if (flash > 0f) {
+                p.color = ((flash * 255).toInt() shl 24) or 0xFFFFFF
+                c.drawRect(-300f, -300f, 700f, 1300f, p)
+            }
+            btn(c, "ЗАБРАТЬ", 40f, 570f, 130f, 56f, k(0xFF00C853)) {
+                if (!save.ownsSkin(boxSkin) || true) {
+                    // сразу надеваем новый скин на выбранного
+                    if (!boxDup) { save.setSkin(save.selected, boxSkin); save.save() }
+                }
+                boxStage = 0
+            }
+            val again = if (boxFree && save.freeBoxes > 0) true else save.coins >= bt.price
+            btn(c, "ЕЩЁ РАЗ", 190f, 570f, 130f, 56f, k(0xFFFFA000), sub = if (boxFree && save.freeBoxes > 0) "бесплатно" else "${bt.price} 💰", enabled = again) {
+                val free = boxFree && save.freeBoxes > 0
+                boxStage = 0
+                buyBox(boxKind, free)
+            }
+        }
+        drawParticles(c)
     }
 }

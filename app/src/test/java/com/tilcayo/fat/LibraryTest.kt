@@ -39,7 +39,13 @@ class LibraryTest {
                             val want = when (tier) { 0 -> sl >= 17f; 1 -> sl >= 13f; 2 -> sl >= 9f; 3 -> sl >= 5f; else -> sl in 5f..13f }
                             if (!want) continue
                             val rep = Verifier.verify(tpl, wantPath = true, extra = sl)
-                            if (rep.ok && rep.path != null) { passed.incrementAndGet(); res = Verifier.withCoins(tpl, rep.path); break }
+                            if (rep.ok && rep.path != null) {
+                                val withCoins = Verifier.withCoins(tpl, rep.path)
+                                // в файл числа пишутся с округлением — проверяем именно то, что окажется в игре
+                                val rounded = ChunkLib.parse(Verifier.format(listOf(withCoins))).first()
+                                if (!Verifier.verify(rounded).ok) continue
+                                passed.incrementAndGet(); res = withCoins; break
+                            }
                         }
                         res
                     })
