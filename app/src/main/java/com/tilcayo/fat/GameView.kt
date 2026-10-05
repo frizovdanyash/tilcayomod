@@ -10,6 +10,7 @@ import android.graphics.ColorMatrixColorFilter
 import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.RadialGradient
 import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
@@ -34,7 +35,9 @@ import kotlin.random.Random
  */
 class GameView(context: Context) : View(context) {
 
-    private enum class Scene { MENU, PLAY, DEAD, FARM, WARDROBE }
+    private enum class Scene { MENU, PLAY, DEAD, FARM, WARDROBE, RUSH, MODS }
+    private enum class Mode { NORMAL, RUSH_TIME, RUSH_TRAIN }
+    private class Virus(var x: Float, var y: Float, val title: String, val msg: String) { var age = 0f }
 
     // ---------- эффекты и UI ----------
     private class Particle(
@@ -167,6 +170,22 @@ class GameView(context: Context) : View(context) {
     private val bumpers get() = sim.bumpers
 
     private val sawPos = FloatArray(2)
+    private var mode = Mode.NORMAL
+    private var rushBoss = 0
+    private var rushT0 = 0f
+    private var rushWon = false
+    private var rushEnd = 0f
+    private var rushTime = 0f
+    private var rushNewBest = false
+    private var rushFirstWin = false
+    private var rushReward = 0L
+    private val viruses = ArrayList<Virus>()
+    private var virusTimer = 0f
+    private var updateAsked = false
+    private val installedCode: Int = try {
+        val pi = context.packageManager.getPackageInfo(context.packageName, 0)
+        if (android.os.Build.VERSION.SDK_INT >= 28) pi.longVersionCode.toInt() else @Suppress("DEPRECATION") pi.versionCode
+    } catch (e: Exception) { 0 }
     private var bossBanner = 0f
     private var bossHint = 0f
     private val boss: Boss? get() = sim.boss
@@ -242,6 +261,7 @@ class GameView(context: Context) : View(context) {
     fun onBack(): Boolean = when (scene) {
         Scene.PLAY -> { paused = !paused; true }
         Scene.WARDROBE -> { if (boxStage == 0) goFarm() else boxStage = 0; true }
+        Scene.RUSH, Scene.MODS -> { goMenu(); true }
         Scene.DEAD, Scene.FARM -> { goMenu(); true }
         Scene.MENU -> false
     }
@@ -292,6 +312,8 @@ class GameView(context: Context) : View(context) {
             Scene.MENU -> drawMenu(c)
             Scene.FARM -> drawFarm(c, dt)
             Scene.WARDROBE -> drawWardrobe(c, dt)
+            Scene.RUSH -> drawRush(c)
+            Scene.MODS -> drawMods(c)
             Scene.PLAY, Scene.DEAD -> {
                 if (scene == Scene.PLAY && !paused) {
                     var rem = dt
@@ -304,7 +326,8 @@ class GameView(context: Context) : View(context) {
                 }
                 stepFx(dt)
                 drawWorld(c)
-                if (scene == Scene.PLAY) drawHud(c) else drawDeadOverlay(c)
+                if (scene == Scene.PLAY && mode == Mode.NORMAL && Mods.has(save.mods, Mods.NIGHT)) drawNight(c)
+                if (scene == Scene.PLAY) { drawHud(c); drawViruses(c) } else drawDeadOverlay(c)
                 if (paused) drawPause(c)
             }
         }
@@ -352,8 +375,10 @@ class GameView(context: Context) : View(context) {
         if (scene == Scene.PLAY && !paused) {
             val wx = rx / scale
             val wy = ry / scale
+            if (virusTap(wx, wy)) return
             when {
                 wx > W - 54f && wy < 70f -> { paused = true; sfx.play(Sfx.S.CLICK) }
+                sim.boss != null && sim.ammo > 0 && hypot(wx - (W - 46f), wy - (viewH - 120f)) < 48f -> sim.shoot()
                 sim.inCannon != null -> sim.fireCannon()
                 sim.onWall -> sim.jump()
                 sim.jumpsLeft > 0 -> { gesturePtr = id; gestureX0 = rx; gestureDone = false }
@@ -390,7 +415,7 @@ class GameView(context: Context) : View(context) {
         when {
             sim.inCannon != null -> sim.fireCannon()
             sim.onWall -> sim.jump()
-            sim.jumpsLeft > 0 -> sim.airJump(dir)
+            sim.jumpsLeft > 0 -> sim.airJump(if (mode == Mode.NORMAL && Mods.has(save.mods, Mods.MIRROR)) -dir else dir)
         }
     }
 
@@ -398,15 +423,12 @@ class GameView(context: Context) : View(context) {
     // Забег: связка Sim с эффектами и звуком
     // =====================================================================
 
-    private fun startRun() {
+    private fun resetCommon() {
         scene = Scene.PLAY
         sceneTime = 0f
         paused = false
         runLevel = save.level(save.selected)
         runSkin = save.skinOf(save.selected)
-        sim.reset(runLevel, save.coinMultiplier(), viewH)
-        gen.reset()
-        gen.fill(sim.camY - 800f)
         shake = 0f
         combo = 0
         comboT = 0f
@@ -415,8 +437,56 @@ class GameView(context: Context) : View(context) {
         gesturePtr = -1
         bossBanner = 0f
         bossHint = 0f
+        rushWon = false
+        rushEnd = 0f
+        viruses.clear()
+        virusTimer = 6f
         particles.clear()
         pops.clear()
+    }
+
+    private fun startRun() {
+        mode = Mode.NORMAL
+        resetCommon()
+        val mods = save.mods
+        sim.reset(runLevel, save.coinMultiplier() * Mods.multiplier(mods), viewH)
+        sim.lavaMul = if (Mods.has(mods, Mods.LAVA)) 1.6f else 1f
+        gen.reset()
+        gen.sparse = Mods.has(mods, Mods.SPARSE)
+        gen.dense = Mods.has(mods, Mods.DENSE)
+        gen.fill(sim.camY - 800f)
+    }
+
+    private fun startRush(timed: Boolean) {
+        mode = if (timed) Mode.RUSH_TIME else Mode.RUSH_TRAIN
+        resetCommon()
+        sim.reset(runLevel, 1f, viewH)
+        sim.lavaMul = 1f
+        sim.startRush(Bosses.all[rushBoss].hp)
+        gen.reset()
+    }
+
+    private fun restartCurrent() {
+        when (mode) {
+            Mode.NORMAL -> startRun()
+            Mode.RUSH_TIME -> startRush(true)
+            Mode.RUSH_TRAIN -> startRush(false)
+        }
+    }
+
+    private fun virusSpawn() {
+        val texts = listOf(
+            "Windows Defender 98" to "Обнаружено 9999 вирусов! Нажмите ОК, чтобы ничего не делать",
+            "Поздравляем!" to "Вы 1000000-й тилкайо! Заберите бесплатный iPhone 15",
+            "ВАШ ТИЛКАЙО ЗАРАЖЁН" to "Срочно закройте это окно, пока оно не закрыло вас",
+            "Обновление Java" to "Для игры в кота требуется обновить Java",
+            "СКИДКА 99%" to "Горячие тилкайо в вашем районе",
+            "Критическая ошибка" to "котозаяц.exe не отвечает. Завершить?",
+            "Антивирус Касперов" to "Ваш антивирус устарел на 100 лет",
+        )
+        val t = texts[rnd.nextInt(texts.size)]
+        viruses.add(Virus(8f + rnd.nextFloat() * (W - 226f), 110f + rnd.nextFloat() * (viewH - 330f), t.first, t.second))
+        sfx.play(Sfx.S.WARN, 1.5f, 0.5f)
     }
 
     private fun stepPlay(dt: Float) {
@@ -428,9 +498,25 @@ class GameView(context: Context) : View(context) {
         for (b in sim.bumpers) b.pop = max(0f, b.pop - dt)
 
         sim.step(dt)
-        gen.fill(sim.camY - 800f)
+        if (mode == Mode.NORMAL) gen.fill(sim.camY - 800f)
         handleEvents()
         sim.cleanup()
+
+        // вирусные окна
+        for (v in viruses) v.age += dt
+        if (mode == Mode.NORMAL && Mods.has(save.mods, Mods.VIRUS)) {
+            virusTimer -= dt
+            if (virusTimer <= 0f) {
+                if (viruses.size < 5) virusSpawn()
+                virusTimer = max(3.5f, 11f - sim.time / 25f) + rnd.nextFloat() * 3f
+            }
+        }
+
+        // победа над боссом в раше: даём доиграть анимацию
+        if (rushWon) {
+            rushEnd -= dt
+            if (rushEnd <= 0f) { finishRush(true); return }
+        }
 
         if (sim.boostT > 0f && rnd.nextFloat() < 0.6f) {
             particles.add(Particle(sim.px, sim.py, (rnd.nextFloat() - 0.5f) * 40f, 40f, 0.4f, 0.4f, 0xFFFFB74D.toInt(), 3f + rnd.nextFloat() * 3f))
@@ -502,6 +588,7 @@ class GameView(context: Context) : View(context) {
                     ring(ev.x, ev.y, 0xFFFF8AD8.toInt())
                 }
                 Ev.BOSS_START -> {
+                    rushT0 = sim.time
                     bossBanner = 3f
                     bossHint = 6f
                     shake = 0.5f
@@ -509,6 +596,16 @@ class GameView(context: Context) : View(context) {
                     performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
                 }
                 Ev.BOSS_TELE -> sfx.play(Sfx.S.WARN)
+                Ev.AMMO -> {
+                    sfx.play(Sfx.S.COIN, 1.7f)
+                    sparkle(ev.x, ev.y, 0xFFFFD54F.toInt())
+                    pops.add(Pop(ev.x, ev.y - 14f, "+патрон", 0xFFFFE082.toInt(), 15f))
+                }
+                Ev.SHOOT -> sfx.play(Sfx.S.THROW, 1.6f, 0.6f)
+                Ev.BULLET_BLOCK -> {
+                    sfx.play(Sfx.S.LAND, 1.4f)
+                    pops.add(Pop(ev.x, ev.y - 14f, "он злой!", 0xFFFF8A80.toInt(), 15f))
+                }
                 Ev.BOSS_FIRE -> sfx.play(Sfx.S.LASER, 0.8f, 0.5f)
                 Ev.BOSS_HIT -> {
                     shake = 0.45f
@@ -521,14 +618,20 @@ class GameView(context: Context) : View(context) {
                         val sp = 100f + rnd.nextFloat() * 200f
                         particles.add(Particle(ev.x, ev.y - 20f, cos(a) * sp, sin(a) * sp - 80f, 0.7f, 0.7f, 0xFFB0BEC5.toInt(), 3f + rnd.nextFloat() * 3f))
                     }
-                    pops.add(Pop(ev.x, ev.y - 70f, "БАМ!", 0xFFFFD54F.toInt(), 26f))
+                    pops.add(Pop(ev.x, ev.y - 70f, if (ev.ref == 2) "ПОПАЛ!" else "БАМ!", 0xFFFFD54F.toInt(), 26f))
                 }
                 Ev.BOSS_DEAD -> {
                     shake = 0.7f
                     sfx.play(Sfx.S.BOSS_DEAD)
-                    save.freeBoxes++
-                    save.save()
-                    pops.add(Pop(W / 2, sim.camY + viewH * 0.3f + 70f, "🎁 бесплатный бокс со скином!", 0xFFFFFFFF.toInt(), 16f))
+                    if (mode == Mode.NORMAL) {
+                        save.freeBoxes++
+                        save.save()
+                        pops.add(Pop(W / 2, sim.camY + viewH * 0.3f + 70f, "🎁 бесплатный бокс со скином!", 0xFFFFFFFF.toInt(), 16f))
+                    } else {
+                        rushWon = true
+                        rushEnd = 2.4f
+                        rushTime = sim.time - rushT0
+                    }
                     pops.add(Pop(W / 2, sim.camY + viewH * 0.3f, "ПОБЕДА!", 0xFFFFD54F.toInt(), 34f))
                     pops.add(Pop(W / 2, sim.camY + viewH * 0.3f + 40f, "+" + fmt(sim.coinMul * 150f) + " монет", 0xFFFFE082.toInt(), 18f))
                     for (i in 0 until 40) {
@@ -543,7 +646,38 @@ class GameView(context: Context) : View(context) {
         sim.events.clear()
     }
 
+    private fun finishRush(win: Boolean) {
+        val def = Bosses.all[rushBoss]
+        scene = Scene.DEAD
+        sceneTime = 0f
+        gesturePtr = -1
+        earned = 0L
+        rushNewBest = false
+        rushFirstWin = false
+        rushReward = 0L
+        if (win && mode == Mode.RUSH_TIME) {
+            val ms = (rushTime * 1000f).toLong()
+            val prev = save.rushBest[rushBoss]
+            if (prev == 0L || ms < prev) { save.rushBest[rushBoss] = ms; rushNewBest = true }
+            rushFirstWin = prev == 0L
+            rushReward = def.reward + max(0, (def.par - rushTime).toInt()) * 8L
+            save.coins += rushReward
+            if (rushFirstWin) save.freeBoxes++
+            earned = rushReward
+        }
+        save.save()
+        deathReason = if (win) "" else sim.deathReason
+        sfx.play(if (win) Sfx.S.BOSS_DEAD else Sfx.S.DEATH)
+        performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        if (!win) for (i in 0 until 28) {
+            val a = rnd.nextFloat() * 2f * PI.toFloat()
+            val sp = 80f + rnd.nextFloat() * 220f
+            particles.add(Particle(sim.px, sim.py, cos(a) * sp, sin(a) * sp - 90f, 0.9f, 0.9f, 0xFFFFB74D.toInt(), 3f + rnd.nextFloat() * 4f))
+        }
+    }
+
     private fun finishRun() {
+        if (mode != Mode.NORMAL) { finishRush(rushWon); return }
         deathReason = sim.deathReason
         scene = Scene.DEAD
         sceneTime = 0f
@@ -1131,6 +1265,26 @@ class GameView(context: Context) : View(context) {
                 text(c, "🥕", h.x, h.y + 8f, 22f, shadow = false)
             }
         }
+        // патроны на земле и летящие пули
+        for (am in sim.ammoItems) {
+            val blink = am.life > 3f || (anim * 8f).toInt() % 2 == 0
+            if (!blink) continue
+            val pu = 1f + 0.12f * sin(anim * 6f)
+            p.style = Paint.Style.FILL
+            p.color = 0x44FFD54F
+            c.drawCircle(am.x, am.y, 17f * pu, p)
+            drawBulletIcon(c, am.x, am.y, 1.3f)
+        }
+        for (bu in sim.bullets) {
+            p.style = Paint.Style.FILL
+            p.color = 0x55FFC107
+            c.drawCircle(bu.x - bu.vx * 0.02f, bu.y - bu.vy * 0.02f, 6f, p)
+            p.color = 0xFFFFC107.toInt()
+            c.drawCircle(bu.x, bu.y, 5.5f, p)
+            p.color = 0xFFFFFFFF.toInt()
+            c.drawCircle(bu.x - 1.5f, bu.y - 1.5f, 2f, p)
+        }
+
         // сам Толстый Котозаяц
         var sx = 1f + 0.03f * sin(anim * 2.4f)
         var sy = 1f - 0.03f * sin(anim * 2.4f)
@@ -1176,6 +1330,246 @@ class GameView(context: Context) : View(context) {
         if (phase >= 2 && b.state != Boss.DEAD) text(c, "💢", b.x + w * 0.38f, b.y - h * 0.38f, 20f, shadow = false)
     }
 
+    private fun drawBulletIcon(c: Canvas, x: Float, y: Float, sc: Float) {
+        p.style = Paint.Style.FILL
+        p.color = 0xFFFFC107.toInt()
+        c.drawRoundRect(x - 3.5f * sc, y - 2f * sc, x + 3.5f * sc, y + 10f * sc, 1.5f * sc, 1.5f * sc, p)
+        p.color = 0xFFFF8F00.toInt()
+        path.reset()
+        path.moveTo(x - 3.5f * sc, y - 2f * sc)
+        path.lineTo(x, y - 10f * sc)
+        path.lineTo(x + 3.5f * sc, y - 2f * sc)
+        path.close()
+        c.drawPath(path, p)
+        p.color = 0xFFFFFFFF.toInt()
+        c.drawRect(x - 3.5f * sc, y + 6f * sc, x + 3.5f * sc, y + 7.5f * sc, p)
+    }
+
+    // ---------- вирусные окна ----------
+
+    private fun virusTap(wx: Float, wy: Float): Boolean {
+        for (i in viruses.indices.reversed()) {
+            val v = viruses[i]
+            if (wx < v.x || wx > v.x + 210f || wy < v.y || wy > v.y + 118f) continue
+            if (wx >= v.x + 186f && wy <= v.y + 22f) {
+                viruses.removeAt(i)
+                sfx.play(Sfx.S.CLICK)
+                performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+            } else if (wx in (v.x + 70f)..(v.x + 140f) && wy in (v.y + 88f)..(v.y + 110f)) {
+                // «ОК» только плодит новые окна
+                if (viruses.size < 6) virusSpawn()
+                sfx.play(Sfx.S.BUMP, 1.4f, 0.6f)
+            }
+            return true
+        }
+        return false
+    }
+
+    private fun wrap(s: String, size: Float, maxW: Float): List<String> {
+        tp.textSize = size
+        val out = ArrayList<String>()
+        var cur = ""
+        for (w in s.split(' ')) {
+            val t = if (cur.isEmpty()) w else "$cur $w"
+            if (tp.measureText(t) > maxW && cur.isNotEmpty()) { out.add(cur); cur = w } else cur = t
+        }
+        if (cur.isNotEmpty()) out.add(cur)
+        return out
+    }
+
+    private fun drawViruses(c: Canvas) {
+        if (viruses.isEmpty()) return
+        c.save()
+        c.scale(scale, scale)
+        for (v in viruses) {
+            val k1 = min(1f, v.age * 6f)
+            c.save()
+            c.translate(v.x + 105f, v.y + 59f)
+            c.scale(0.6f + 0.4f * k1, 0.6f + 0.4f * k1)
+            c.translate(-105f, -59f)
+            p.style = Paint.Style.FILL
+            p.color = 0x55000000
+            c.drawRect(4f, 4f, 214f, 122f, p)
+            p.color = 0xFFECECEC.toInt()
+            c.drawRect(0f, 0f, 210f, 118f, p)
+            p.color = 0xFF1E3C9E.toInt()
+            c.drawRect(0f, 0f, 210f, 22f, p)
+            text(c, v.title, 6f, 15f, 10f, 0xFFFFFFFF.toInt(), Paint.Align.LEFT, shadow = false, maxW = 170f)
+            p.color = 0xFFE53935.toInt()
+            c.drawRect(186f, 3f, 206f, 19f, p)
+            text(c, "✕", 196f, 15f, 11f, 0xFFFFFFFF.toInt(), shadow = false)
+            val lines = wrap(v.msg, 11f, 190f)
+            for ((i, ln) in lines.withIndex()) text(c, ln, 10f, 42f + i * 14f, 11f, 0xFF212121.toInt(), Paint.Align.LEFT, shadow = false)
+            p.color = 0xFFC8C8C8.toInt()
+            c.drawRect(70f, 88f, 140f, 110f, p)
+            p.style = Paint.Style.STROKE
+            p.strokeWidth = 1.5f
+            p.color = 0xFF616161.toInt()
+            c.drawRect(70f, 88f, 140f, 110f, p)
+            p.style = Paint.Style.FILL
+            text(c, "OK", 105f, 104f, 12f, 0xFF212121.toInt(), shadow = false)
+            c.restore()
+        }
+        c.restore()
+    }
+
+    private fun drawNight(c: Canvas) {
+        val cx = sim.px * scale
+        val cy = (sim.py - sim.camY) * scale
+        val r = 200f * scale
+        p.style = Paint.Style.FILL
+        p.shader = RadialGradient(cx, cy, r, intArrayOf(0x00000000, 0x00000000, 0xF5000000.toInt()), floatArrayOf(0f, 0.42f, 1f), Shader.TileMode.CLAMP)
+        c.drawRect(0f, 0f, width.toFloat(), height.toFloat(), p)
+        p.shader = null
+    }
+
+    // ---------- обновления ----------
+
+    private fun checkUpdates() {
+        val now = System.currentTimeMillis()
+        if (updateAsked || now - save.lastUpdateCheck < 6 * 3600_000L) return
+        updateAsked = true
+        Thread {
+            val info = Updater.fetch()
+            post {
+                if (info != null) {
+                    save.lastUpdateCheck = System.currentTimeMillis()
+                    save.remoteCode = info.code
+                    save.remoteName = info.name
+                    save.remoteNotes = info.notes
+                    save.remoteApk = info.apk
+                    save.save()
+                }
+            }
+        }.start()
+    }
+
+    private fun openDownload() {
+        try {
+            val url = save.remoteApk.ifBlank { Updater.APK_FALLBACK }
+            context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url)).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (e: Exception) {
+            toast("Не удалось открыть браузер")
+        }
+    }
+
+    // ---------- экран босс-раша ----------
+
+    private fun fmtTime(ms: Long) = if (ms <= 0L) "—" else "%.1f с".format(ms / 1000f)
+
+    private fun drawRush(c: Canvas) {
+        drawBackground(c, k(0xFF2B0A1A), k(0xFF6A1B3A), anim * 20f)
+        c.save()
+        c.translate(uiOx, uiOy)
+        c.scale(ui, ui)
+        btn(c, "◀", 10f, 14f, 52f, 44f, k(0xFF5C6BC0)) { goMenu() }
+        text(c, "БОСС-РАШ", 180f, 50f, 32f)
+        text(c, "победи босса на время или потренируйся", 180f, 78f, 12f, 0xBBFFFFFF.toInt(), maxW = 330f)
+        for ((i, def) in Bosses.all.withIndex()) {
+            val y = 96f + i * 250f
+            panel(c, 14f, y, 332f, 232f, 0x77000000, 22f)
+            val bw = 128f
+            val bh = bw * bossSprite.height / bossSprite.width
+            val bob = sin(anim * 2f)
+            rect.set(26f, y + 20f + bob * 3f, 26f + bw, y + 20f + bh + bob * 3f)
+            c.drawBitmap(bossSprite, null, rect, bmpPaint)
+            text(c, def.name, 196f, y + 40f, 18f, 0xFFFFF3C4.toInt(), Paint.Align.LEFT, maxW = 142f)
+            text(c, "здоровье: ${def.hp}", 196f, y + 64f, 13f, 0xFFFFFFFF.toInt(), Paint.Align.LEFT)
+            text(c, "лучшее время:", 196f, y + 88f, 12f, 0xAAFFFFFF.toInt(), Paint.Align.LEFT)
+            text(c, fmtTime(save.rushBest[i]), 196f, y + 110f, 20f, 0xFFFFD54F.toInt(), Paint.Align.LEFT, maxW = 142f)
+            text(c, "награда: ${def.reward} 💰 + за скорость", 196f, y + 132f, 10f, 0xCCFFFFFF.toInt(), Paint.Align.LEFT, maxW = 142f)
+            if (save.rushBest[i] == 0L) text(c, "первая победа: 🎁 бокс", 196f, y + 146f, 10f, 0xFF00E676.toInt(), Paint.Align.LEFT, maxW = 142f)
+            btn(c, "⏱ НА ВРЕМЯ", 26f, y + 166f, 152f, 52f, k(0xFFE53935)) { rushBoss = i; startRush(true) }
+            btn(c, "🎯 ТРЕНИРОВКА", 188f, y + 166f, 146f, 52f, k(0xFF5C6BC0)) { rushBoss = i; startRush(false) }
+        }
+        val y2 = 96f + Bosses.all.size * 250f
+        panel(c, 14f, y2, 332f, 74f, 0x44000000, 22f)
+        text(c, "❓ Новые боссы — скоро", 180f, y2 + 44f, 16f, 0x88FFFFFF.toInt())
+        c.restore()
+    }
+
+    // ---------- экран модификаторов ----------
+
+    private fun drawMods(c: Canvas) {
+        drawBackground(c, k(0xFF1B1035), k(0xFF3A1E6A), anim * 20f)
+        c.save()
+        c.translate(uiOx, uiOy)
+        c.scale(ui, ui)
+        btn(c, "◀", 10f, 14f, 52f, 44f, k(0xFF5C6BC0)) { goMenu() }
+        text(c, "МОДИФИКАТОРЫ", 190f, 48f, 26f, maxW = 230f)
+        text(c, "усложняй забег и получай больше монет", 180f, 78f, 12f, 0xBBFFFFFF.toInt(), maxW = 330f)
+        for ((i, md) in Mods.all.withIndex()) {
+            val y = 92f + i * 84f
+            val on = Mods.has(save.mods, md.id)
+            panel(c, 10f, y, 340f, 76f, if (on) 0xAA1B5E20.toInt() else 0x66000000, 16f)
+            if (on) {
+                p.style = Paint.Style.STROKE
+                p.strokeWidth = 2.5f
+                p.color = 0xFF00E676.toInt()
+                c.drawRoundRect(10f, y, 350f, y + 76f, 16f, 16f, p)
+                p.style = Paint.Style.FILL
+            }
+            text(c, md.emoji, 40f, y + 48f, 34f, shadow = false)
+            text(c, md.name, 70f, y + 30f, 16f, 0xFFFFFFFF.toInt(), Paint.Align.LEFT, maxW = 190f)
+            for ((j, ln) in wrap(md.desc, 11f, 190f).take(2).withIndex()) text(c, ln, 70f, y + 48f + j * 13f, 11f, 0xCCFFFFFF.toInt(), Paint.Align.LEFT, shadow = false)
+            val good = md.bonus >= 0f
+            val pct = Math.round(md.bonus * 100)
+            panel(c, 268f, y + 14f, 72f, 28f, if (good) 0xFF2E7D32.toInt() else 0xFFC62828.toInt(), 14f)
+            text(c, (if (good) "+" else "") + pct + "%", 304f, y + 34f, 15f, maxW = 64f)
+            text(c, if (on) "ВКЛ" else "выкл", 304f, y + 62f, 12f, if (on) 0xFF00E676.toInt() else 0x99FFFFFF.toInt(), shadow = false)
+            buttons.add(Btn(10f, y, 340f, 76f) {
+                save.mods = Mods.toggle(save.mods, md.id)
+                save.save()
+                sfx.play(Sfx.S.CLICK)
+            })
+        }
+        val mul = Mods.multiplier(save.mods)
+        panel(c, 10f, 604f, 340f, 84f, 0x88000000.toInt(), 18f)
+        text(c, "Монеты за забег", 180f, 634f, 14f, 0xBBFFFFFF.toInt())
+        text(c, "x" + "%.2f".format(mul), 180f, 676f, 38f, if (mul >= 1f) 0xFF00E676.toInt() else 0xFFFF8A80.toInt())
+        text(c, "Действуют только в обычных забегах, не в босс-раше", 180f, 706f, 11f, 0x88FFFFFF.toInt(), maxW = 330f)
+        btn(c, "▶  ИГРАТЬ", 50f, 724f, 260f, 56f, k(0xFF00C853)) { startRun() }
+        c.restore()
+    }
+
+    // ---------- итог босс-раша ----------
+
+    private fun drawRushResult(c: Canvas) {
+        c.save()
+        c.translate(uiOx, uiOy)
+        c.scale(ui, ui)
+        p.color = 0x88000000.toInt()
+        c.drawRect(-uiOx / ui, -uiOy / ui, 360f + uiOx / ui, 800f + uiOy / ui, p)
+        val a = min(1f, sceneTime * 3f)
+        c.save()
+        c.translate(0f, (1f - a) * 40f)
+        panel(c, 24f, 150f, 312f, 430f, 0xEE231A3D.toInt(), 24f)
+        val train = mode == Mode.RUSH_TRAIN
+        if (rushWon) {
+            text(c, "ПОБЕДА!", 180f, 205f, 44f, 0xFF00E676.toInt())
+            text(c, Bosses.all[rushBoss].name + " повержен", 180f, 236f, 15f, 0xCCFFFFFF.toInt(), maxW = 280f)
+            text(c, "%.1f с".format(rushTime), 180f, 310f, 60f, maxW = 280f)
+            if (train) {
+                text(c, "тренировка — награды нет", 180f, 350f, 15f, 0xAAFFFFFF.toInt())
+            } else {
+                if (rushNewBest) text(c, "🏆 НОВЫЙ РЕКОРД!", 180f, 350f, 22f, 0xFFFFD54F.toInt())
+                else text(c, "лучшее: " + fmtTime(save.rushBest[rushBoss]), 180f, 350f, 17f, 0xAAFFFFFF.toInt())
+                text(c, "💰 +$rushReward", 180f, 396f, 30f, 0xFFFFE082.toInt())
+                if (rushFirstWin) text(c, "🎁 первая победа: бесплатный бокс!", 180f, 428f, 15f, 0xFF00E676.toInt(), maxW = 290f)
+            }
+        } else {
+            text(c, "ПОРАЖЕНИЕ", 180f, 205f, 40f, 0xFFFF8A80.toInt())
+            text(c, deathReason, 180f, 238f, 15f, 0xCCFFFFFF.toInt(), maxW = 280f)
+            val hp = sim.boss?.hp
+            text(c, if (hp != null) "боссу осталось: $hp ❤" else "", 180f, 320f, 22f, 0xFFFFD54F.toInt())
+            text(c, if (train) "тренируйся сколько нужно" else "попробуй ещё!", 180f, 356f, 15f, 0xAAFFFFFF.toInt())
+        }
+        btn(c, "ЕЩЁ РАЗ", 48f, 450f, 264f, 56f, k(0xFF00C853)) { restartCurrent() }
+        btn(c, "К БОССАМ", 48f, 516f, 264f, 48f, k(0xFFE53935)) { scene = Scene.RUSH; sceneTime = 0f }
+        c.restore()
+        c.restore()
+    }
+
     private fun drawSaw(c: Canvas, x: Float, y: Float, ang: Float) {
         c.save()
         c.translate(x, y)
@@ -1202,12 +1596,19 @@ class GameView(context: Context) : View(context) {
         c.save()
         c.scale(scale, scale)
         val m = (-minPy / 10f).toInt()
-        text(c, "$m м", W / 2, 66f, 40f)
-        if (save.best > 0) text(c, "рекорд ${save.best} м", W / 2, 86f, 13f, 0xBBFFD54F.toInt())
-        panel(c, 12f, 36f, 96f, 30f, 0x55000000)
-        text(c, "💰 ${runCoins.toInt()}", 20f, 58f, 19f, 0xFFFFE082.toInt(), Paint.Align.LEFT, maxW = 84f)
-        if (coinMul > 1f) text(c, "x${fmt(coinMul)}", 12f, 82f, 12f, 0xAAFFFFFF.toInt(), Paint.Align.LEFT)
-        if (combo >= 3) text(c, "комбо x$combo", 12f, 100f, 13f, 0xFFFFD54F.toInt(), Paint.Align.LEFT)
+        if (mode == Mode.NORMAL) {
+            text(c, "$m м", W / 2, 66f, 40f)
+            if (save.best > 0) text(c, "рекорд ${save.best} м", W / 2, 86f, 13f, 0xBBFFD54F.toInt())
+            panel(c, 12f, 36f, 96f, 30f, 0x55000000)
+            text(c, "💰 ${runCoins.toInt()}", 20f, 58f, 19f, 0xFFFFE082.toInt(), Paint.Align.LEFT, maxW = 84f)
+            if (coinMul > 1f || coinMul < 1f) text(c, "x${fmt(coinMul)}", 12f, 82f, 12f, 0xAAFFFFFF.toInt(), Paint.Align.LEFT)
+            if (combo >= 3) text(c, "комбо x$combo", 12f, 100f, 13f, 0xFFFFD54F.toInt(), Paint.Align.LEFT)
+            var ix = 12f
+            for (md in Mods.all) if (Mods.has(save.mods, md.id)) { text(c, md.emoji, ix, 122f, 14f, shadow = false); ix += 19f }
+        } else {
+            val t = if (sim.boss != null || rushWon) (if (rushWon) rushTime else sim.time - rushT0) else 0f
+            text(c, if (mode == Mode.RUSH_TIME) "⏱ %.1f".format(t) else "🎯 тренировка", W / 2, 66f, 38f, maxW = 220f)
+        }
         // босс: полоска здоровья, баннер, подсказка
         val bs = sim.boss
         if (bs != null && bs.state != Boss.DEAD) {
@@ -1220,6 +1621,29 @@ class GameView(context: Context) : View(context) {
                 c.drawRoundRect(55f + i * segW + 2f, 117f, 55f + (i + 1) * segW - 2f, 123f, 3f, 3f, p)
             }
         }
+        if (bs != null && bs.state != Boss.DEAD && bs.state != Boss.ENTER) {
+            val angry = Boss.angry(bs.state)
+            val label = if (angry) "🔥 ЗЛОЙ — не трогай!" else if (bs.state == Boss.STUN) "💫 оглушён" else "😌 спокоен — бей!"
+            text(c, label, W / 2, 148f, 13f, if (angry) 0xFFFF8A80.toInt() else 0xFFA5D6A7.toInt(), maxW = 260f)
+        }
+        // кнопка стрельбы: появляется, когда есть патроны
+        if (bs != null && sim.ammo > 0 && bs.state != Boss.DEAD) {
+            val bx = W - 46f
+            val by = viewH - 120f
+            val calm = !Boss.angry(bs.state) && bs.state != Boss.STUN
+            val pulse = if (calm) 1f + 0.06f * sin(anim * 9f) else 1f
+            p.style = Paint.Style.FILL
+            p.color = if (calm) 0xDDFF9800.toInt() else 0x99666666.toInt()
+            c.drawCircle(bx, by, 34f * pulse, p)
+            p.style = Paint.Style.STROKE
+            p.strokeWidth = 3f
+            p.color = 0xFFFFFFFF.toInt()
+            c.drawCircle(bx, by, 34f * pulse, p)
+            p.style = Paint.Style.FILL
+            drawBulletIcon(c, bx, by - 2f, 1.5f)
+            text(c, "×${sim.ammo}", bx + 22f, by + 30f, 15f, 0xFFFFFFFF.toInt())
+            if (calm) text(c, "ОГОНЬ", bx, by - 42f, 11f, 0xFFFFE082.toInt())
+        }
         if (bossBanner > 0f) {
             val ba = min(1f, bossBanner).coerceIn(0f, 1f)
             val col = ((ba * 255).toInt() shl 24) or 0xFFFF1744.toInt().and(0xFFFFFF)
@@ -1227,7 +1651,8 @@ class GameView(context: Context) : View(context) {
             text(c, "ТОЛСТЫЙ КОТОЗАЯЦ", W / 2, viewH * 0.36f + 34f, 24f, ((ba * 255).toInt() shl 24) or 0xFFFFFF, maxW = 330f)
         } else if (bossHint > 0f && bs != null) {
             val ha = min(1f, bossHint).coerceIn(0f, 1f)
-            text(c, "ПРЫГАЙ ЕМУ НА ГОЛОВУ СВЕРХУ!", W / 2, viewH * 0.8f, 16f, ((ha * 255).toInt() shl 24) or 0xFFFFFF, maxW = 330f)
+            text(c, "Пока он спокоен — коснись его! Злого не трогай", W / 2, viewH * 0.8f, 15f, ((ha * 255).toInt() shl 24) or 0xFFFFFF, maxW = 340f)
+            text(c, "Подбирай патроны и стреляй издалека", W / 2, viewH * 0.8f + 20f, 13f, ((ha * 255).toInt() shl 24) or 0xFFFFE082.toInt().and(0xFFFFFF), maxW = 340f)
         }
         // кнопка паузы
         panel(c, W - 48f, 14f, 36f, 36f, 0x77000000, 18f)
@@ -1263,6 +1688,7 @@ class GameView(context: Context) : View(context) {
     }
 
     private fun drawDeadOverlay(c: Canvas) {
+        if (mode != Mode.NORMAL) { drawRushResult(c); return }
         c.save()
         c.translate(uiOx, uiOy)
         c.scale(ui, ui)
@@ -1295,23 +1721,40 @@ class GameView(context: Context) : View(context) {
     // =====================================================================
 
     private fun drawMenu(c: Canvas) {
+        checkUpdates()
         drawBackground(c, k(0xFF1B1035), k(0xFF5A2A8A), anim * 40f)
         c.save()
         c.translate(uiOx, uiOy)
         c.scale(ui, ui)
 
-        text(c, "ТОЛСТЫЙ", 180f, 120f, 56f, k(0xFFFFD54F))
-        text(c, "ТИЛКАЙО", 180f, 180f, 62f, k(0xFFFFFFFF))
-        text(c, "прыгай · собирай · откармливай · размножай", 180f, 212f, 13f, 0xBBFFFFFF.toInt(), maxW = 330f)
+        text(c, "ТОЛСТЫЙ", 180f, 118f, 54f, k(0xFFFFD54F))
+        text(c, "ТИЛКАЙО", 180f, 176f, 60f, k(0xFFFFFFFF))
+        text(c, "прыгай · собирай · откармливай · размножай", 180f, 206f, 13f, 0xBBFFFFFF.toInt(), maxW = 330f)
 
         val lvl = save.level(save.selected)
         val bob = sin(anim * 2.5f)
-        drawTilcayo(c, 180f, 380f + bob * 8f, 40f + lvl * 3f, 1, bob * 4f, 1f + bob * 0.03f, 1f - bob * 0.03f, lvl, save.skinOf(save.selected))
-        text(c, Balance.names[save.selected % Balance.names.size] + " · ур. $lvl", 180f, 470f, 20f, 0xFFFFF3C4.toInt())
+        drawTilcayo(c, 180f, 345f + bob * 8f, 38f + lvl * 2.6f, 1, bob * 4f, 1f + bob * 0.03f, 1f - bob * 0.03f, lvl, save.skinOf(save.selected))
+        text(c, Balance.names[save.selected % Balance.names.size] + " · ур. $lvl", 180f, 440f, 19f, 0xFFFFF3C4.toInt())
 
-        btn(c, "▶  ИГРАТЬ", 50f, 520f, 260f, 80f, k(0xFF00C853)) { startRun() }
-        btn(c, "🐾  ФЕРМА", 50f, 618f, 260f, 64f, k(0xFF7C4DFF), sub = if (save.pending() > 0) "ждёт +${save.pending()} 💰" else if (save.freeBoxes > 0) "🎁 ждёт бесплатный бокс" else null) { goFarm() }
-        btn(c, if (save.sound) "🔊" else "🔇", 150f, 706f, 60f, 48f, k(0xFF5C6BC0)) { toggleSound() }
+        btn(c, "▶  ИГРАТЬ", 50f, 462f, 260f, 78f, k(0xFF00C853)) { startRun() }
+        btn(c, "🐾  ФЕРМА", 50f, 552f, 126f, 58f, k(0xFF7C4DFF),
+            sub = if (save.pending() > 0) "+${save.pending()} 💰" else if (save.freeBoxes > 0) "🎁 бокс ждёт" else null) { goFarm() }
+        btn(c, "⚔  БОСС-РАШ", 184f, 552f, 126f, 58f, k(0xFFE53935)) { scene = Scene.RUSH; sceneTime = 0f }
+        val mc = Mods.count(save.mods)
+        btn(c, "⚙  МОДИФИКАТОРЫ", 50f, 622f, 200f, 56f, k(0xFF00897B),
+            sub = if (mc > 0) "$mc вкл · монеты x" + "%.2f".format(Mods.multiplier(save.mods)) else "нет") { scene = Scene.MODS; sceneTime = 0f }
+        btn(c, if (save.sound) "🔊" else "🔇", 258f, 622f, 52f, 56f, k(0xFF5C6BC0)) { toggleSound() }
+
+        // плашка «доступно обновление» — только в главном меню
+        if (save.remoteCode > installedCode && save.dismissedCode != save.remoteCode) {
+            panel(c, 10f, 698f, 340f, 90f, 0xEE0D47A1.toInt(), 18f)
+            text(c, "🔔 Доступна версия ${save.remoteName}", 20f, 722f, 16f, 0xFFFFFFFF.toInt(), Paint.Align.LEFT, maxW = 320f)
+            if (save.remoteNotes.isNotBlank()) {
+                for ((j, ln) in wrap(save.remoteNotes, 10.5f, 320f).take(2).withIndex()) text(c, ln, 20f, 738f + j * 12f, 10.5f, 0xCCFFFFFF.toInt(), Paint.Align.LEFT, shadow = false)
+            }
+            btn(c, "СКАЧАТЬ", 20f, 748f, 150f, 34f, k(0xFF00C853)) { openDownload() }
+            btn(c, "ПОЗЖЕ", 180f, 748f, 100f, 34f, k(0xFF5C6BC0)) { save.dismissedCode = save.remoteCode; save.save() }
+        }
 
         panel(c, 20f, 20f, 120f, 34f, 0x66000000)
         text(c, "💰 ${save.coins}", 30f, 44f, 20f, 0xFFFFE082.toInt(), Paint.Align.LEFT, maxW = 104f)

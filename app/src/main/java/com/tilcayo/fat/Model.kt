@@ -83,6 +83,20 @@ class SaveData(context: Context) {
     /** Какие скины открыты (битовая маска). */
     var ownedSkins: Long = sp.getLong("ownedSkins", 1L) or 1L
 
+    /** Включённые модификаторы забега (битовая маска). */
+    var mods: Int = sp.getInt("mods", 0)
+
+    /** Лучшее время босс-раша по каждому боссу (мс, 0 — ещё не побеждён). */
+    val rushBest = LongArray(Bosses.all.size) { sp.getLong("rushBest$it", 0L) }
+
+    /** Проверка обновлений. */
+    var lastUpdateCheck: Long = sp.getLong("lastUpdateCheck", 0L)
+    var remoteCode: Int = sp.getInt("remoteCode", 0)
+    var remoteName: String = sp.getString("remoteName", "") ?: ""
+    var remoteNotes: String = sp.getString("remoteNotes", "") ?: ""
+    var remoteApk: String = sp.getString("remoteApk", "") ?: ""
+    var dismissedCode: Int = sp.getInt("dismissedCode", 0)
+
     /** Бесплатные боксы (за победу над боссом). */
     var freeBoxes: Int = sp.getInt("freeBoxes", 0)
 
@@ -199,6 +213,14 @@ class SaveData(context: Context) {
             .putInt("activeFarm", activeFarm)
             .putLong("ownedSkins", ownedSkins)
             .putInt("freeBoxes", freeBoxes)
+            .putInt("mods", mods)
+            .putLong("lastUpdateCheck", lastUpdateCheck)
+            .putInt("remoteCode", remoteCode)
+            .putString("remoteName", remoteName)
+            .putString("remoteNotes", remoteNotes)
+            .putString("remoteApk", remoteApk)
+            .putInt("dismissedCode", dismissedCode)
+        for (i in rushBest.indices) e.putLong("rushBest$i", rushBest[i])
         for (i in farms.indices) {
             val sfx = if (i == 0) "" else "$i"
             val f = farms[i]

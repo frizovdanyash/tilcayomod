@@ -78,6 +78,83 @@ class BossTest {
         return Pair(sim.bossesBeaten > 0, sim.time)
     }
 
+    private fun arenaSim(): Sim {
+        val sim = Sim()
+        sim.reset(5, 1f, 800f)
+        sim.startRush(5)
+        // дождаться, пока босс въедет и перейдёт в спокойное парение
+        var guard = 0
+        while (guard++ < 2000 && sim.boss?.state != Boss.HOVER) { sim.shield = 9f; sim.py = sim.arena!!.bottom - 100f; sim.step(1f / 60f) }
+        sim.shield = 0f
+        return sim
+    }
+
+    @Test
+    fun calmBossIsHurtByAnyTouch() {
+        val sim = arenaSim()
+        val b = sim.boss!!
+        assert(b.state == Boss.HOVER)
+        // подходим сбоку и касаемся
+        sim.onWall = false
+        sim.px = b.x - (Boss.R * 0.92f + sim.hr - 4f); sim.py = b.y; sim.pvx = 0f; sim.pvy = 0f
+        val hp0 = b.hp
+        sim.step(1f / 60f)
+        println("TOUCH hp $hp0 -> ${sim.boss?.hp} dead=${sim.dead}")
+        assert(!sim.dead && sim.boss!!.hp == hp0 - 1)
+    }
+
+    @Test
+    fun angryBossKillsOnTouch() {
+        val sim = arenaSim()
+        val b = sim.boss!!
+        b.state = Boss.VOLLEY_TELE
+        b.t = 0f
+        sim.onWall = false
+        sim.px = b.x - (Boss.R * 0.92f + sim.hr - 4f); sim.py = b.y; sim.pvx = 0f; sim.pvy = 0f
+        sim.step(1f / 60f)
+        println("ANGRY dead=${sim.dead}")
+        assert(sim.dead)
+    }
+
+    @Test
+    fun bulletsHurtOnlyCalmBoss() {
+        for (angry in booleanArrayOf(false, true)) {
+            val sim = arenaSim()
+            val b = sim.boss!!
+            sim.ammo = 1
+            sim.py = sim.arena!!.bottom - 100f
+            sim.onWall = true
+            assert(sim.shoot())
+            if (angry) { b.state = Boss.RAIN_TELE; b.t = 0f }
+            val hp0 = b.hp
+            var n = 0
+            while (n++ < 240 && sim.bullets.isNotEmpty()) {
+                sim.shield = 9f
+                if (angry) { b.t = 0f }
+                sim.step(1f / 60f)
+            }
+            println("BULLET angry=$angry hp $hp0 -> ${sim.boss?.hp}")
+            if (angry) assert(sim.boss!!.hp == hp0) else assert(sim.boss!!.hp == hp0 - 1)
+        }
+    }
+
+    @Test
+    fun ammoAppearsRarely() {
+        var spawned = 0
+        val sim = arenaSim()
+        var t = 0f
+        while (t < 120f && !sim.dead) {
+            sim.shield = 9f
+            sim.py = sim.arena!!.bottom - 100f; sim.px = 40f; sim.onWall = true
+            sim.step(1f / 60f)
+            for (e in sim.events) if (e.type == Ev.AMMO) spawned++
+            sim.events.clear()
+            if (sim.ammoItems.isNotEmpty()) { spawned = maxOf(spawned, 1) }
+            t += 1f / 60f
+        }
+        println("AMMO spawned/picked in 120s (rough)=$spawned")
+    }
+
     @Test
     fun dangerBaselines() {
         // пассивный игрок и случайный игрок: сколько живут рядом с боссом
